@@ -1,0 +1,2 @@
+# YuiSoul
+local ai assistant
