@@ -6,7 +6,11 @@ SESSION_DIR = "sessions"
 SESSION_FILE = os.path.join(SESSION_DIR, "latest.json")
 
 def save_session(messages: list):
-    os.makedirs(SESSION_DIR, exist_ok=True)
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+    except FileExistsError:
+        pass # Защита от race condition при Ctrl+C
+        
     data = {
         "saved_at": datetime.now().isoformat(),
         "messages": messages

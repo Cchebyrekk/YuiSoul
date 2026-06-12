@@ -8,411 +8,442 @@ from core.session_manager import load_session, save_session, clear_session
 from core.prompt_builder import build_system_prompt
 from core.autonomy_manager import AutonomyManager
 from core.soul_manager import SoulManager
+from core.tts_manager import TTSManager
+from memory.memory_manager import MemoryManager
+from core.tool_registry import TOOLS, build_registry
+from core.prompt_builder import get_dynamic_state # Добавь этот импорт в начало файла
+
+mm = MemoryManager() 
+tts_engine = TTSManager(rvc_model_name="yui_girl.pth", rvc_api_url="http://127.0.0.1:7865") 
+TOOL_REGISTRY = build_registry(mm) # Инициализация реестра
 
 control = ComputerControl()
 agent_is_working = threading.Event()
 
-# --- CONFIGURATION ---
 ENABLE_AUTONOMY = False
-
-def parse_tool_calls(raw_text: str) -> list[dict]:
-    """Парсит JSON (объекты и массивы), очищает от Markdown и нативного формата"""
-    tools = []
-    
-    # 1. Очищаем от Markdown-оберток (```json ... ```)
-    raw_text = re.sub(r'```json\s*', '', raw_text)
-    raw_text = re.sub(r'```\s*', '', raw_text)
-    
-    # 2. Проверяем нативный формат Gemma
-    gemma_match = re.search(r'<\|?tool_call\|?>call:\s*(\w+)\{(.+?)\}<\|?tool_call\|?>', raw_text, re.DOTALL)
-    if gemma_match:
-        tool_name = gemma_match.group(1)
-        params_str = gemma_match.group(2).strip()
-        params = {}
-        pairs = re.findall(r'(\w+)\s*:\s*"?([^"}]+)"?', params_str)
-        for key, val in pairs:
-            params[key.strip()] = val.strip()
-        if params:
-            return [{"tool": tool_name, "params": params}]
-
-    # 3. Пытаемся распарсить весь очищенный текст как стандартный JSON
-    try:
-        parsed = json.loads(raw_text.strip())
-        if isinstance(parsed, list):
-            # Если модель вернула массив [{"tool":...}, {"tool":...}]
-            return [item for item in parsed if isinstance(item, dict) and "tool" in item]
-        elif isinstance(parsed, dict) and "tool" in parsed:
-            # Если вернула один объект {"tool":...}
-            return [parsed]
-    except json.JSONDecodeError:
-        pass # Если не парсится целиком, падаем в глубокий поиск
-
-    # 4. Глубокий поиск (выковыривает JSON из любого мусора)
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(raw_text):
-        next_brace = raw_text.find('{', idx)
-        if next_brace == -1:
-            break
-        try:
-            obj, end_idx = decoder.raw_decode(raw_text[next_brace:])
-            if "tool" in obj:
-                tools.append(obj)
-            idx = next_brace + end_idx
-        except json.JSONDecodeError:
-            idx = next_brace + 1
-            
-    return tools
+MAX_CONTEXT_CHARS = 60000
 
 def compress_context(messages: list) -> list:
-    """Жесткая резка контекста с учетом буфера под 100k токенов"""
-    MAX_CONTEXT_CHARS = 60000 
-    
-    if len(str(messages)) < MAX_CONTEXT_CHARS:
+    TAIL_CHARS_LIMIT = MAX_CONTEXT_CHARS/4 
+    total_chars = len(str(messages))
+    if total_chars < MAX_CONTEXT_CHARS:
         return messages
 
-    print("\n[SYSTEM WARNING] Контекст приближается к лимиту генерации. Резка истории.")
-    
+    print(f"\n[SYSTEM WARNING] Контекст достиг {total_chars} символов. Резка истории.")
     system_msg = messages[0]
-    # Сохраняем последние 8 сообщений (4 полных цикла инструмент-ответ)
-    tail_msgs = messages[-8:]
+    rest_msgs = messages[1:]
+    
+    tail_msgs = []
+    tail_chars = 0
+    for msg in reversed(rest_msgs):
+        msg_chars = len(str(msg))
+        if tail_chars + msg_chars > TAIL_CHARS_LIMIT:
+            break
+        tail_msgs.insert(0, msg)
+        tail_chars += msg_chars
+    
+    deleted_msgs = rest_msgs[:len(rest_msgs) - len(tail_msgs)]
+    if deleted_msgs:
+        extract_and_save_facts(deleted_msgs)
     
     new_messages = [system_msg]
     new_messages.append({
         "role": "user", 
-        "content": "<system_warning>Контекст переполнен. Старые данные извлечены в /memory. Продолжай с текущего состояния.</system_warning>"
+        "content": "<system_warning>Контекст переполнен. Продолжай с текущего состояния.</system_warning>"
     })
     new_messages.extend(tail_msgs)
-    
+    save_session(new_messages)
     return new_messages
 
-def format_raw_gemma_prompt(messages: list) -> str:
-    """Конвертирует список сообщений в нативный формат Gemma 4 без прослойки OpenAI"""
-    prompt = ""
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        
-        if role == "system":
-            prompt += f"<start_of_turn>system\n{content}<end_of_turn>\n"
-        elif role == "user":
-            prompt += f"<start_of_turn>user\n{content}<end_of_turn>\n"
-        elif role == "assistant":
-            prompt += f"<start_of_turn>model\n{content}<end_of_turn>\n"
-            
-    # Добавляем триггер для генерации модели
-    prompt += "<start_of_turn>model\n"
-    return prompt
-
 def extract_and_save_facts(history: list):
-    """Извлекает факты с агрессивной фильтрацией мусора от 4B модели"""
-    from memory.memory_manager import MemoryManager
-    mm = MemoryManager()
-    
-    # Получаем дерево для передачи в промпт
     tree = mm._get_tree() 
-    
-    # --- AGGRESSIVE FILTERING OF SYSTEM EVENTS ---
-    # Отрезаем результаты работы инструментов, чтобы 4B модель не пыталась пере-сохранить то, что уже сохранено
     cleaned_history = []
     for msg in history:
-        clean_content = re.sub(r'<system_event>.*?</system_event>', '', msg.get("content", ""), flags=re.DOTALL)
+        clean_content = msg.get("content", "")
+        clean_content = re.sub(r'<system_event>.*?</system_event>', '', clean_content, flags=re.DOTALL)
         if clean_content.strip():
             cleaned_history.append({"role": msg["role"], "content": clean_content.strip()})
         
     extraction_prompt = mm.get_fact_extraction_prompt(cleaned_history, tree)
     
     try:
-        raw_prompt = format_raw_gemma_prompt([{"role": "user", "content": extraction_prompt}])
-        response = requests.post("http://127.0.0.1:8080/completion", json={
-            "prompt": raw_prompt,
-            "n_predict": 2048,
+        response = requests.post("http://127.0.0.1:8080/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": extraction_prompt}],
+            "max_tokens": 2048,
             "temperature": 0.2,
-            "stop": ["<start_of_turn>", "<end_of_turn>"]
-        }, timeout=60.0)
+        }, timeout=180.0)
         
-        raw_facts = response.json().get("content", "").strip()
-        
-        # Убираем остатки XML
+        raw_facts = response.json()["choices"][0]["message"]["content"].strip()
         raw_facts = re.sub(r'<[^>]+>', '', raw_facts).strip()
         
         if not raw_facts or raw_facts.upper() == "NULL":
             return
 
-        # --- AGGRESSIVE FILTERING ---
-        # Список слов-маркеров рассуждений модели (на русском и английском)
-        garbage_keywords = [
-            'анализ:', 'источник:', 'шаг:', 'формат:', 'итоговый', 'вывод:', 
-            'факты:', 'самопроверка:', 'финальный', 'правила:', 'пример:', 
-            'analysis:', 'step', 'conclusion:', 'note:', 'format:'
-        ]
-        
-        valid_facts = set() # Используем SET для мгновенного убийства дублей внутри одной генерации
+        garbage_keywords = ['анализ:', 'источник:', 'шаг:', 'формат:', 'итоговый', 'вывод:', 'факты:', 'самопроверка:']
+        valid_facts = set()
         
         for line in raw_facts.split('\n'):
             line = line.strip("- *").strip()
             if not line: continue
-            
-            # Отсекаем строки, которые начинаются со слов-маркеров (без учета регистра)
-            if any(line.lower().startswith(kw) for kw in garbage_keywords):
-                continue
-                
-            # Парсим ТОЛЬКО валидный формат [путь] текст
+            if any(line.lower().startswith(kw) for kw in garbage_keywords): continue
             match = re.match(r'^\[(.*?)\]\s*(.*)', line)
             if match:
-                path = match.group(1).strip()
-                fact = match.group(2).strip()
-                
-                # Дополнительная проверка: факт не должен быть слишком коротким (случайные слова)
-                if len(fact) > 5:
-                    valid_facts.add( (path, fact) )
-            # Фолбэк на misc/unsorted УДАЛЕН. Если модель не able выдать правильный формат - факт просто отбрасывается.
+                path, fact = match.group(1).strip(), match.group(2).strip()
+                if len(fact) > 5: valid_facts.add((path, fact))
             
-        # --- SAVE LOOP ---
         saved_count = 0
         for path, fact in valid_facts:
             mm.save_fact(path, fact)
             saved_count += 1
-            
-        if saved_count > 0:
-            print(f"[SYSTEM] Факты ({saved_count} шт.) распределены по /memory.")
+        if saved_count > 0: print(f"[SYSTEM] Факты ({saved_count} шт.) распределены.")
             
     except Exception as e:
         print(f"[SYSTEM ERROR] Извлечение фактов провалено: {e}")
 
 def run_agent_loop(user_task: str, messages: list = None, max_steps: int = 10):
     print(f"[SYSTEM] Запуск агента. Задача: {user_task}")
-    # --- ДИНАМИЧЕСКАЯ ДУША ---
+    
     sm = SoulManager()
     current_soul_patch = sm.generate_soul_patch()
-    current_system_prompt = build_system_prompt(soul_patch=current_soul_patch)
-    # --------------------------
+    current_system_prompt = build_system_prompt(soul_patch=current_soul_patch, context_memory="") 
     
+    auto_mem = mm.get_auto_context(user_task)
+    dynamic_state = get_dynamic_state() # Получаем время и температуру
+    user_input_final = user_task
+    
+    if auto_mem:
+        print(f"\n[SYSTEM AUTO-MEMORY EXTRACTED]:\n{auto_mem}\n")
+        user_input_final = (
+            f"{user_task}\n\n"
+            f"<injected_context>\n{dynamic_state}\n\n"
+            f"ВНИМАНИЕ! Система УЖЕ нашла в памяти ответ. "
+            f"ЗАПРЕЩЕНО вызывать search_memory. Используй ТОЛЬКО эти данные:\n{auto_mem}\n</injected_context>"
+        )
+    else:
+        # Если памяти нет, всё равно инжектим время и железо, чтобы модель их видела
+        user_input_final = (
+            f"{user_task}\n\n"
+            f"<injected_context>\n{dynamic_state}\n</injected_context>"
+        )
+
     if messages is None:
         existing_session = load_session()
         if existing_session:
             print("[SYSTEM] Обнаружена предыдущая сессия. Восстановление...")
             messages = existing_session
             messages[0]["content"] = current_system_prompt
-            messages.append({"role": "user", "content": user_task})
+            messages.append({"role": "user", "content": user_input_final})
         else:
-            messages = [{"role": "system", "content": current_system_prompt}, {"role": "user", "content": user_task}]
+            messages = [{"role": "system", "content": current_system_prompt}, {"role": "user", "content": user_input_final}]
     else:
         messages[0]["content"] = current_system_prompt
-        messages.append({"role": "user", "content": user_task})
+        messages.append({"role": "user", "content": user_input_final})
     
     try:
         for step in range(1, max_steps + 1):
             print(f"\n--- ИТЕРАЦИЯ {step} ---")
-            
-            # Контроль переполнения перед каждым шагом
             messages = compress_context(messages)
-            # --- RAW COMPLETION (Bypass OpenAI Template) ---
-            raw_reply = ""
-            max_retries = 3
             
-            # Превращаем историю в одну сырую строку
-            raw_prompt = format_raw_gemma_prompt(messages)
+            max_retries = 3
+            raw_reply = ""
+            reasoning_reply = ""
+            tool_calls = []
             
             for attempt in range(max_retries):
                 agent_is_working.set() 
-                response = requests.post("http://127.0.0.1:8080/completion", json={
-                    "prompt": raw_prompt,
-                    "n_predict": 8192,
+                
+                payload = {
+                    "messages": messages,
+                    "tools": TOOLS, # <--- ПЕРЕДАЕМ СХЕМУ В API
+                    "max_tokens": 8192,
                     "temperature": 0.4,
-                    "stop": ["<start_of_turn>", "<end_of_turn>", "</response_format>", "<|eot_id|>"] 
-                })
-                agent_is_working.clear()
+                    "stream": True
+                }
+                
+                response = requests.post("http://127.0.0.1:8080/v1/chat/completions", json=payload, stream=True, timeout=120.0)
 
-                # --- ЗАЩИТА ОТ ПЕРЕПОЛНЕНИЯ ЖЕЛЕЗА ---
-                if response.status_code == 400 and "exceed_context_size" in response.text:
-                    print("\n[SYSTEM CRITICAL] Физический лимит токенов превышен (llama.cpp 400).")
-                    print("[SYSTEM] Инициация экстренной резки контекста...")
-                    
-                    # Сохраняем системный промпт и последние 2 сообщения (чтобы модель помнила, что делала)
-                    system_msg = messages[0]
-                    tail_msgs = messages[-2:]
-                    middle_msgs = messages[1:-2]
-                    
-                    # Выжимаем факты из отрезанной части
-                    if middle_msgs:
-                        extract_and_save_facts(middle_msgs)
-                    
-                    # Пересобираем контекст
-                    messages = [system_msg]
-                    messages.append({
-                        "role": "user", 
-                        "content": "<system_warning>КРИТИЧЕСКОЕ ПЕРЕПОЛНЕНИЕ. Старая история экстренно извлечена в память. Забудь старый контекст и продолжай исходя из текущего состояния.</system_warning>"
-                    })
-                    messages.extend(tail_msgs)
-                    
-                    print("[SYSTEM] Контекст обрезан. Перезапуск итерации...")
-                    time.sleep(1)
-                    continue # Возвращаемся в начало цикла for с обрезанным контекстом
-                # -----------------------------------------
+                if response.status_code == 400:
+                    if "exceed_context_size" in response.text:
+                        print("\n[SYSTEM CRITICAL] Лимит токенов превышен. Резка...")
+                        system_msg = messages[0]
+                        tail_msgs = messages[-2:]
+                        middle_msgs = messages[1:-2]
+                        if middle_msgs: extract_and_save_facts(middle_msgs)
+                        messages = [system_msg] + [{"role": "user", "content": "<system_warning>КРИТИЧЕСКОЕ ПЕРЕПОЛНЕНИЕ.</system_warning>"}] + tail_msgs
+                        agent_is_working.clear()
+                        time.sleep(1)
+                        continue 
 
                 if response.status_code != 200:
+                    agent_is_working.clear()
                     print(f"[ERROR] Сервер упал: {response.text}")
                     break
                     
-                # У нативного эндпоинта другой путь к контенту
-                raw_reply = response.json().get("content", "").strip()
+                raw_reply = ""
+                tool_calls = []
                 
-                # --- TAG NORMALIZER (Решение конфликта нативных весов Gemma) ---
-                # Переводим любые нативные токены размышлений в наш стандартный формат
-                raw_reply = raw_reply.replace("<|thought|>", "<thought>").replace("<|/thought|>", "</thought>")
-                raw_reply = raw_reply.replace("<|thinking|>", "<thought>").replace("<|/thinking|>", "</thought>")
-                raw_reply = re.sub(r'<\|[^>]*\|?>', '', raw_reply)
+                # Ассемблирование стриминга (с поддержкой потоковых tool_calls)
+                current_tc = None
+                print("[LLM STREAM]: ", end="", flush=True)
                 
-                # Очистка утечек нативного шаблона Gemma
-                raw_reply = raw_reply.replace("</response_format>", "").replace("<end_of_turn>", "")
+                for line in response.iter_lines():
+                    if not line: continue
+                    decoded_line = line.decode('utf-8')
+                    if not decoded_line.startswith('data: '): continue
+                    json_str = decoded_line[6:]
+                    if json_str.strip() == '[DONE]': break
+                    
+                    try:
+                        chunk_data = json.loads(json_str)
+                        delta = chunk_data.get('choices', [{}])[0].get('delta', {})
+                        
+                        # Перехват нативных скрытых размышлений (если llama.cpp их отделил)
+                        if 'reasoning_content' in delta and delta['reasoning_content']:
+                            token = delta['reasoning_content']
+                            reasoning_reply += token
+                            # Выводим в консоль серым цветом, чтобы не путать с ответом
+                            print(f"\033[90m{token}\033[0m", end="", flush=True)
+                            
+                        # Обработка текста
+                        if 'content' in delta and delta['content']:
+                            token = delta['content']
+                            raw_reply += token
+                            print(token, end="", flush=True)
+                            
+                        # Обработка потоковых tool_calls (OpenAI format)
+                        if 'tool_calls' in delta:
+                            for tc_chunk in delta['tool_calls']:
+                                idx = tc_chunk.get("index", 0)
+                                # Расширяем список, если пришел новый индекс
+                                while len(tool_calls) <= idx:
+                                    tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                
+                                tc = tool_calls[idx]
+                                if tc_chunk.get("id"): tc["id"] = tc_chunk["id"]
+                                if tc_chunk.get("function", {}).get("name"): tc["function"]["name"] += tc_chunk["function"]["name"]
+                                if tc_chunk.get("function", {}).get("arguments"): tc["function"]["arguments"] += tc_chunk["function"]["arguments"]
+                                
+                    except json.JSONDecodeError:
+                        continue
                 
-                # Если модель взяла рекурсию тегов (спам <output><output>), схлопываем в один
-                raw_reply = re.sub(r'(<output>\s*)+', '<output>', raw_reply)
-                # -------------------------------------------------------------------
+                print() # Перенос после стрима
+                agent_is_working.clear()
+                
+                # ======================================================
+                # ПРЕПРОЦЕССИНГ: РАЗДЕЛЕНИЕ ПО ТЕГУ ВЫХОДА ИЗ МЫСЛЕЙ
+                # ======================================================
+                
+                # 1. Режем по закрывающему тегу </thought>
+                if '</thought>' in raw_reply:
+                    parts = raw_reply.split('</thought>', 1)
+                    # Всё, что до тега — это мысли (даже если модель забыла открыть <thought>)
+                    reasoning_reply += parts[0].strip()
+                    # Всё, что после — финальный ответ
+                    raw_reply = parts[1].strip()
+                else:
+                    # Фолбэк: если модель вообще не вывела </thought>, но вывела <output>
+                    # значит весь текст до <output> был размышлением
+                    if '<output>' in raw_reply and not reasoning_reply:
+                        out_match = re.search(r'(<output>)', raw_reply)
+                        if out_match:
+                            reasoning_reply += raw_reply[:out_match.start()].strip()
+                            # raw_reply оставляем как есть, экстрактор <output> ниже его заберет
 
-                if raw_reply:
+                # 2. АГРЕССИВНАЯ ВЫРЕЗКА QWEN-ПРЕАМБУЛ (извлекли в мысли, но из ответа вырезать)
+                # Модель может спамить преамбулы до выхода из размышлений, это уже ушло в reasoning_reply.
+                # Но если она написала преамбулу после </thought>, выжигаем:
+                preamble_patterns = [
+                    r'^\s*Here\'s a thinking process:.*?(?=\n|<output>|$)',
+                    r'^\s*Thinking Process:.*?(?=\n|<output>|$)',
+                    r'^\s*The user wants me to perform.*?(?=\n|<output>|$)'
+                ]
+                for pattern in preamble_patterns:
+                    raw_reply = re.sub(pattern, '', raw_reply, flags=re.DOTALL).strip()
+
+                # 3. Вырезаем оставшиеся огрызки тегов <output>, если модель забыла их закрыть
+                raw_reply = re.sub(r'</?output>', '', raw_reply).strip()
+                
+                # Вывод очищенного результата
+                if reasoning_reply:
+                    print(f"\n[LLM REASONING EXTRACTED]: {reasoning_reply.strip()}")
+                print(f"[LLM RAW CLEANED]: {raw_reply}")
+
+                # ======================================================
+                # ОМНИ-ПАРСЕР (Фолбэк, если llama.cpp не перехватил вызов)
+                # ======================================================
+                if not tool_calls:
+                    # Формат 1: <tool_code>tool_name(param="val")</tool_code> (Выдала Qwen сейчас)
+                    tc_match = re.search(r'<tool_code>\s*(\w+)\((.*?)\)\s*</tool_code>', raw_reply, re.DOTALL)
+                    if tc_match:
+                        name = tc_match.group(1)
+                        args_str = tc_match.group(2)
+                        params = {}
+                        # Парсим key="value" или key='value'
+                        for k, v in re.findall(r'(\w+)\s*=\s*["\']([^"\']*)["\']', args_str):
+                            params[k] = v
+                        tool_calls.append({
+                            "id": "fallback_0", "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(params)}
+                        })
+                    
+                    # Формат 2: ✿function_call✿: {...}
+                    elif "✿function_call✿" in raw_reply:
+                        match = re.search(r'✿function_call✿:\s*({.*?})', raw_reply, re.DOTALL)
+                        if match:
+                            try:
+                                parsed = json.loads(match.group(1))
+                                tool_calls.append({
+                                    "id": "fallback_1", "type": "function",
+                                    "function": {"name": parsed.get("name"), "arguments": json.dumps(parsed.get("arguments", {}))}
+                                })
+                            except: pass
+                            
+                    # Формат 3: Глубокий поиск JSON {"tool": "...", "params": {...}}
+                    if not tool_calls:
+                        decoder = json.JSONDecoder()
+                        idx = 0
+                        while idx < len(raw_reply):
+                            next_brace = raw_reply.find('{', idx)
+                            if next_brace == -1: break
+                            try:
+                                obj, end_idx = decoder.raw_decode(raw_reply[next_brace:])
+                                if isinstance(obj, dict) and ("tool" in obj or "name" in obj):
+                                    t_name = obj.get("tool", obj.get("name"))
+                                    t_params = obj.get("params", obj.get("arguments", {}))
+                                    if isinstance(t_params, str):
+                                        try: t_params = json.loads(t_params)
+                                        except: t_params = {}
+                                    tool_calls.append({
+                                        "id": f"fallback_json_{len(tool_calls)}", "type": "function",
+                                        "function": {"name": t_name, "arguments": json.dumps(t_params) if isinstance(t_params, dict) else "{}"}
+                                    })
+                                idx = next_brace + end_idx
+                            except json.JSONDecodeError:
+                                idx = next_brace + 1
+                
+                if raw_reply or tool_calls:
                     break
                 else:
                     print(f"[SYSTEM] Пустой ответ. Retry {attempt + 1}/{max_retries}...")
                     time.sleep(0.5)
             
-            if not raw_reply:
+            if not raw_reply and not tool_calls:
                 print("[SYSTEM] Модель упорно молчит. Сброс итерации.")
                 continue
             
-            # --- PRE-PROCESSOR (Санитария 4B модели) ---
-            # 1. Убиваем рекурсию закрытых/открытых тегов (схлопываем любые повторы в один)
-            raw_reply = re.sub(r'(</thought>\s*)+', '</thought>', raw_reply)
-            raw_reply = re.sub(r'(<thought>\s*)+', '<thought>', raw_reply)
-            raw_reply = re.sub(r'(</instrument_call>\s*)+', '</instrument_call>', raw_reply)
-            raw_reply = re.sub(r'(<instrument_call>\s*)+', '<instrument_call>', raw_reply)
-            raw_reply = re.sub(r'(</output>\s*)+', '</output>', raw_reply)
-            raw_reply = re.sub(r'(<output>\s*)+', '<output>', raw_reply)
-
-            # 2. Неявное закрытие тегов (если модель забыла закрыть)
-            raw_reply = re.sub(r'(<thought>)(.*?)(?=(?:<instrument_call>|<output>))', r'\1\2</thought>', raw_reply, flags=re.DOTALL)
-            raw_reply = re.sub(r'(<instrument_call>)(.*?)(?=(?:<output>|$))', r'\1\2</instrument_call>', raw_reply, flags=re.DOTALL)
-
-            # 3. Удаление физических переносов строк внутри JSON
-            raw_reply = re.sub(
-                r'<instrument_call>(.*?)</instrument_call>', 
-                lambda m: m.group(0).replace('\n', ' '), 
-                raw_reply, 
-                flags=re.DOTALL
-            )
-            # ---------------------------------------------
-
             print(f"[LLM RAW]: {raw_reply}")
-            # -------------------------------------------------
+            if tool_calls: print(f"[TOOL CALLS]: {json.dumps(tool_calls, indent=2)}")
             
-            tool_list = parse_tool_calls(raw_reply)
-            
-            if tool_list:
+            # --- ИСПОЛНЕНИЕ ИНСТРУМЕНТОВ ---
+            if tool_calls:
                 os_results = []
-                for tool_data in tool_list:
+                assistant_msg = {"role": "assistant", "content": raw_reply, "tool_calls": tool_calls}
+                messages.append(assistant_msg)
+                
+                for tc in tool_calls:
                     agent_is_working.set()
-                    tool_name = tool_data["tool"]
-                    params = tool_data.get("params", {})
-                    os_result = "" # Инициализация во избежание UnboundLocalError
+                    func_name = tc["function"]["name"]
+                    func_args_str = tc["function"]["arguments"]
                     
-                    if tool_name == "task_complete":
-                        # Ищем текст внутри <output>. Если тег не закрыт, берем до конца строки.
+                    try:
+                        func_args = json.loads(func_args_str)
+                    except json.JSONDecodeError:
+                        func_args = {}
+                    
+                    # Спец-обработка task_complete
+                    if func_name == "task_complete":
                         output_match = re.search(r'<output>(.*?)(?:</output>|$)', raw_reply, re.DOTALL)
                         final_text = output_match.group(1).strip() if output_match else ""
-                        
                         if final_text:
                             print(f"\n[YUI FINAL]: {final_text}")
-                            
-                        print(f"\n[SYSTEM] Агент завершил работу.")
-                        print(f"[REASON]: {params.get('reason', 'Не указана')}")
-                        
+                            tts_engine.speak(final_text)
+                        print(f"\n[SYSTEM] Агент завершил работу. Причина: {func_args.get('reason', 'Не указана')}")
                         extract_and_save_facts(messages[1:])
-                        
                         save_session(messages)
                         agent_is_working.clear()
                         return messages
 
-                    # --- ИНСТРУМЕНТЫ ПАМЯТИ ---
-                    elif tool_name == "save_memory":
-                        from memory.memory_manager import MemoryManager
-                        mm = MemoryManager()
-                        os_result = mm.save_fact(params.get("path", "misc/default"), params.get("content", ""))
-                        
-                        # Проверка на конфликт (Серая зона)
-                        if isinstance(os_result, dict) and os_result.get("status") == "conflict":
-                            c = os_result
-                            os_result = (
-                                f"[MEMORY CONFLICT] В файле {c['path']} найден спорный факт (Схожесть: {c['similarity']}).\n"
-                                f"Старый: {c['old_fact']}\n"
-                                f"Новый: {c['new_fact']}\n"
-                                f"Ты должна решить: это один и тот же факт (вызови save_memory с тем же путем, чтобы ПЕРЕЗАПИСАТЬ старый на новый) "
-                                f"или это разные вещи (вызови task_complete, система оставит старый факт и допишет новый отдельно)."
-                            )
-                        
-                    elif tool_name == "search_memory":
-                        from memory.memory_manager import MemoryManager
-                        mm = MemoryManager()
-                        os_result = mm.search_facts(params.get("query", ""))
-                    # ----------------------------
-
-                    else:
-                        print(f"[ACTION] -> {tool_name} | {params}")
-                        os_result = control.execute_action(tool_name, params)
+                    # ДИСПЕТЧЕР РЕЕСТРА
+                    if func_name in TOOL_REGISTRY:
+                        print(f"[ACTION] -> {func_name} | {func_args}")
+                        os_result = TOOL_REGISTRY[func_name](**func_args)
                         print(f"[OS LOG] {os_result}")
                         
-                        if tool_name == "open_app":
+                        # Перехват флага task_complete (если модель передала его без инструмента)
+                        if isinstance(os_result, str) and os_result.startswith("TASK_COMPLETE:"):
+                            print(f"\n[SYSTEM] Агент завершил работу.")
+                            extract_and_save_facts(messages[1:])
+                            save_session(messages)
+                            agent_is_working.clear()
+                            return messages
+                            
+                        if func_name == "open_app":
                             print("[SYSTEM] Ждем фокуса окна...")
                             time.sleep(3)
                         else:
                             time.sleep(0.8)
+                    else:
+                        os_result = f"[ERROR] Неизвестный инструмент: {func_name}"
+                        print(os_result)
                     
-                    # Обязательно собираем результат КАЖДОЙ итерации
                     os_results.append(os_result)
+                    
+                    # Добавляем результат инструмента в формат OpenAI
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": str(os_result)
+                    })
                 
-                # Обновление контекста происходит после выполнения всей цепочки инструментов
-                messages.append({"role": "assistant", "content": raw_reply})
-                # Жесткая обертка системного ответа, чтобы модель не путала его с речью человека
-                messages.append({"role": "user", "content": f"<system_event>Результат выполнения: {os_results}</system_event>"})
                 agent_is_working.clear()
                 
             else:
-                # Защита от пустого EOS токена
-                if not raw_reply:
+                # Логика финального ответа без инструментов
+                
+                # 1. ОБЯЗАТЕЛЬНО сохраняем ответ ассистента в историю, 
+                # иначе на следующей итерации он забудет, что уже ответил, и зациклится.
+                messages.append({"role": "assistant", "content": raw_reply})
+                
+                if not raw_reply and not reasoning_reply:
                     print("[SYSTEM] Агент выдал пустой ответ.")
                     return messages
                 
-                # Если инструментов нет — чистим мусор от тегов перед выводом
-                clean_output = re.sub(r'<thought>.*?</thought>', '', raw_reply, flags=re.DOTALL).strip()
-                clean_output = re.sub(r'<instrument_call>.*?</instrument_call>', '', clean_output, flags=re.DOTALL).strip()
-                clean_output = clean_output.replace("<output>", "").replace("</output>", "").strip()
+                # 2. Экстракция текста для TTS
+                output_match = re.search(r'<output>(.*?)(?:</output>|$)', raw_reply, re.DOTALL)
+                if output_match:
+                    clean_output = output_match.group(1).strip()
+                else:
+                    clean_output = raw_reply.strip()
+                
+                # АГРЕССИВНАЯ ЗАЩИТА TTS: Вырезаем ЛЮБЫЕ XML-подобные теги 
+                clean_output = re.sub(r'<[^>]+>', '', clean_output).strip()
+                clean_output = clean_output.replace('```', '').strip()
 
                 if clean_output:
                     print(f"\n[YUI FINAL]: {clean_output}")
+                    tts_engine.speak(clean_output)
                 else:
-                    print("[SYSTEM] Агент выдал невалидный ответ (только мысли без output).")
+                    print("[SYSTEM] Агент выдал невалидный ответ (только мысли/код без текста).")
                 
+                # 3. Сохраняем факты и ПРИНУДИТЕЛЬНО выходим из цикла итераций
                 extract_and_save_facts(messages[1:])
+                save_session(messages)
                 return messages
             
     except KeyboardInterrupt:
-        print("\n[SYSTEM] Ручная остановка (Ctrl+C). Спасаю факты и контекст...")
-        if len(messages) > 1:
-            extract_and_save_facts(messages[1:])
+        print("\n[SYSTEM] Ручная остановка (Ctrl+C). Спасаю факты...")
+        if len(messages) > 1: extract_and_save_facts(messages[1:])
         save_session(messages)
-        print("[SYSTEM] Сессия сохранена.")
         return messages
     except Exception as e:
-        print(f"\n[SYSTEM] Фатальная ошибка: {e}. Спасаю факты и контекст...")
-        if len(messages) > 1:
-            extract_and_save_facts(messages[1:])
+        print(f"\n[SYSTEM] Фатальная ошибка: {e}. Спасаю факты...")
+        if len(messages) > 1: extract_and_save_facts(messages[1:])
         save_session(messages)
         return messages
 
 if __name__ == "__main__":
     current_messages = None 
     session_state = {"messages": []}
-    
     autonomy = None
     
     if ENABLE_AUTONOMY:
@@ -421,21 +452,15 @@ if __name__ == "__main__":
         
     try:
         while True:
-            try:
-                user_input = input()
+            try: user_input = input()
             except KeyboardInterrupt:
                 print("\n[SYSTEM] Завершение работы YUI.")
                 break
-            
             if not user_input.strip(): continue
             current_messages = run_agent_loop(user_input, current_messages)
-            session_state["messages"] = current_messages
-            
+            session_state["messages"] = current_messages if current_messages else []
     except Exception as e:
         print(f"\n[SYSTEM FATAL] Падение основного цикла: {e}")
     finally:
-        if autonomy is not None:
-            autonomy.stop() 
-        if current_messages:
-            print("[SYSTEM] Финальное сохранение сессии...")
-            save_session(current_messages)
+        if autonomy is not None: autonomy.stop() 
+        if current_messages: save_session(current_messages)
