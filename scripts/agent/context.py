@@ -17,6 +17,7 @@ from scripts.config import (
 )
 from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.prompt import get_dynamic_state
+from scripts.utils.http import SESSION
 
 
 def estimate_chars(messages: List[Dict[str, str]]) -> int:
@@ -105,8 +106,7 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         extraction_prompt = memory_manager.get_fact_extraction_prompt(cleaned_history, tree)
 
         try:
-            import requests
-            response = requests.post(
+            response = SESSION.post(
                 LLM_API_URL,
                 json={
                     "messages": [{"role": "user", "content": extraction_prompt}],
@@ -159,12 +159,14 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         thread.start()
 
 
-def inject_dynamic_context(user_input: str, memory_context: str = "") -> str:
+def inject_dynamic_context(user_input: str, memory_context: str = "", soul_patch: str = "") -> str:
     """
-    Инжектит в пользовательский запрос динамическое состояние (время, железо)
-    и, опционально, контекст из памяти.
+    Инжектит в пользовательский запрос динамическое состояние (время, железо,
+    статус памяти, soul patch) и, опционально, найденный контекст из памяти.
+    Всё изменчивое сюда, а не в системный промпт — см. комментарий над
+    SYSTEM_PROMPT в prompt.py про стабильность KV-кэша llama.cpp.
     """
-    dynamic_state = get_dynamic_state()
+    dynamic_state = get_dynamic_state(soul_patch=soul_patch)
     parts = [user_input]
 
     if memory_context:

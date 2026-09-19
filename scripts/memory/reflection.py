@@ -34,6 +34,7 @@ from scripts.config import (
 )
 from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.autonomy import get_idle_seconds
+from scripts.utils.http import SESSION
 
 
 # Адаптация sleepConsolidator из kuni под файловую (по темам, не по-записям)
@@ -80,15 +81,20 @@ class ReflectionManager:
 
     def __init__(self, memory_manager: MemoryManager,
                  check_interval: int = REFLECTION_CHECK_INTERVAL,
-                 idle_threshold: int = REFLECTION_IDLE_THRESHOLD):
+                 idle_threshold: int = REFLECTION_IDLE_THRESHOLD,
+                 agent_is_working: threading.Event = None):
         """
         :param memory_manager: экземпляр MemoryManager для чтения/записи фактов.
         :param check_interval: интервал между проверками (сек), см. REFLECTION_CHECK_INTERVAL в config.py.
         :param idle_threshold: минимальное время бездействия пользователя для запуска (сек).
+        :param agent_is_working: событие основного цикла — если установлено, рефлексия
+            и сон-консолидация пропускают свой LLM-запрос в этот раз, чтобы не отнимать
+            слот у llama-server прямо в момент интерактивного ответа (см. AutonomyManager).
         """
         self.mm = memory_manager
         self.check_interval = check_interval
         self.idle_threshold = idle_threshold
+        self.agent_is_working = agent_is_working
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -123,6 +129,9 @@ class ReflectionManager:
             if idle_sec < self.idle_threshold:
                 continue  # пользователь активен — не беспокоим
 
+            if self.agent_is_working is not None and self.agent_is_working.is_set():
+                continue  # основной цикл сейчас держит LLM — не мешаем
+
             # Запускаем один цикл рефлексии
             try:
                 self._run_reflection_cycle()
@@ -134,7 +143,9 @@ class ReflectionManager:
             # лёгкая рефлексия-инсайт срабатывала чаще, а тяжёлая
             # переработка файлов памяти — реже.
             self._cycle_count += 1
-            if ENABLE_SLEEP_CONSOLIDATION and self._cycle_count % SLEEP_CONSOLIDATION_EVERY_N_CYCLES == 0:
+            sleep_due = ENABLE_SLEEP_CONSOLIDATION and self._cycle_count % SLEEP_CONSOLIDATION_EVERY_N_CYCLES == 0
+            agent_busy_now = self.agent_is_working is not None and self.agent_is_working.is_set()
+            if sleep_due and not agent_busy_now:
                 try:
                     self._run_sleep_consolidation_cycle()
                 except Exception as e:
@@ -189,7 +200,7 @@ class ReflectionManager:
         )
 
         try:
-            response = requests.post(
+            response = SESSION.post(
                 LLM_API_URL,
                 json={
                     "messages": [{"role": "user", "content": prompt}],
@@ -331,7 +342,7 @@ class ReflectionManager:
         prompt_body += "\n\n---\n\n".join(body_parts)
 
         try:
-            response = requests.post(
+            response = SESSION.post(
                 LLM_API_URL,
                 json={
                     "messages": [

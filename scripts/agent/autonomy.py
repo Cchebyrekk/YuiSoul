@@ -21,6 +21,7 @@ from scripts.config import (
 )
 from scripts.memory.soul import SoulManager
 from scripts.agent.emotion import EmotionBridge
+from scripts.utils.http import SESSION
 
 
 # Структура для получения времени бездействия (Windows API)
@@ -53,17 +54,25 @@ class AutonomyManager:
                  check_interval: int = AUTONOMY_CHECK_INTERVAL,
                  idle_threshold: int = AUTONOMY_IDLE_THRESHOLD,
                  soul_manager: SoulManager = None,
-                 emotion_bridge: EmotionBridge = None):
+                 emotion_bridge: EmotionBridge = None,
+                 agent_is_working: threading.Event = None):
         """
         :param check_interval: интервал проверки бездействия (сек).
         :param idle_threshold: минимальное время бездействия для запуска (сек).
         :param soul_manager: экземпляр SoulManager для генерации пайча.
         :param emotion_bridge: экземпляр EmotionBridge для отправки эмоций.
+        :param agent_is_working: событие основного цикла. Если установлено —
+            фоновая мысль не отправляет запрос к LLM в этот раз: у llama-server
+            ограниченное число слотов, и интерактивный ответ пользователю важнее
+            спонтанной мысли. Idle-проверка сама по себе (по клавиатуре/мыши)
+            этого не гарантирует — пользователь может активно говорить голосом,
+            почти не трогая клавиатуру/мышь.
         """
         self.check_interval = check_interval
         self.idle_threshold = idle_threshold
         self.soul_manager = soul_manager if soul_manager else SoulManager()
         self.emotion_bridge = emotion_bridge if emotion_bridge else EmotionBridge()
+        self.agent_is_working = agent_is_working
 
         self._running = False
         self._thread: threading.Thread | None = None
@@ -95,6 +104,12 @@ class AutonomyManager:
             if idle_sec < self.idle_threshold:
                 continue
 
+            if self.agent_is_working is not None and self.agent_is_working.is_set():
+                # Основной цикл прямо сейчас занят LLM (может быть голосовой
+                # разговор без активности клавиатуры/мыши). Не лезем со
+                # спонтанной мыслью — не отнимаем слот у интерактивного ответа.
+                continue
+
             # Пользователь бездействует — генерируем мысль
             idle_min = idle_sec // 60
             time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -113,7 +128,7 @@ class AutonomyManager:
             )
 
             try:
-                response = requests.post(
+                response = SESSION.post(
                     LLM_API_URL,
                     json={
                         "messages": [{"role": "user", "content": prompt}],

@@ -5,6 +5,7 @@
 Запускает фоновые потоки, обрабатывает ввод из очереди (клавиатура + голос),
 выполняет итерации агента, управляет сессией.
 """
+import concurrent.futures
 import queue
 import random
 import threading
@@ -30,6 +31,7 @@ from scripts.config import (
     ENABLE_REFLECTION,
     SILENCE_NUDGE_CHANCE
 )
+from scripts.utils.http import SESSION
 from scripts.agent.session import save_session, load_session, clear_session
 from scripts.agent.prompt import build_system_prompt
 from scripts.agent.context import compress_context, extract_and_save_facts, inject_dynamic_context
@@ -107,14 +109,22 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
         registry = build_registry(memory_manager)
         executor = ActionExecutor(memory_manager, tts_manager, registry)
 
-    # 1. Генерируем системный промпт с учётом души
-    soul_patch = soul_manager.generate_soul_patch()
-    system_prompt = build_system_prompt(soul_patch=soul_patch)
+    # 1. Системный промпт СТАТИЧЕН (см. комментарий над prompt.SYSTEM_PROMPT) —
+    # это не зависит от soul_patch/памяти и не требует пересборки каждый ход.
+    system_prompt = build_system_prompt()
 
-    # 2. Автоматический контекст из памяти (RAG)
-    auto_mem = memory_manager.get_auto_context(user_task)
-    # Инжектируем динамическое состояние (время, железо) и память
-    user_input_final = inject_dynamic_context(user_task, auto_mem)
+    # 2. soul_patch (чтение нескольких маленьких файлов) и get_auto_context
+    # (векторный поиск — encode на CPU, самая долгая часть этой пары) друг от
+    # друга не зависят, поэтому считаем их параллельно, а не последовательно.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _prep_pool:
+        soul_future = _prep_pool.submit(soul_manager.generate_soul_patch)
+        auto_mem_future = _prep_pool.submit(memory_manager.get_auto_context, user_task)
+        soul_patch = soul_future.result()
+        auto_mem = auto_mem_future.result()
+
+    # Всё изменчивое (время, железо, статус памяти, soul patch, найденный
+    # контекст) едет в хвост — в user-сообщение, а не в системный промпт.
+    user_input_final = inject_dynamic_context(user_task, auto_mem, soul_patch=soul_patch)
 
     # 3. Загружаем или инициализируем историю
     if messages is None:
@@ -202,7 +212,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 }
 
                 try:
-                    response = requests.post(LLM_API_URL, json=payload, stream=True, timeout=LLM_TIMEOUT)
+                    response = SESSION.post(LLM_API_URL, json=payload, stream=True, timeout=LLM_TIMEOUT)
                     if response.status_code != 200:
                         print(f"[ERROR] LLM вернул {response.status_code}: {response.text}")
                         agent_is_working.clear()
@@ -329,19 +339,22 @@ if __name__ == "__main__":
     stt_mgr = STTManager(input_queue=input_queue, agent_busy_event=agent_is_working)
     stt_mgr.start()
 
-    # Автономия (если включена)
+    # Автономия (если включена). agent_is_working передаём, чтобы фоновая
+    # мысль не отнимала слот у llama-server прямо в момент, когда основной
+    # цикл ждёт ответ на реплику пользователя.
     autonomy = None
     if ENABLE_AUTONOMY:
         autonomy = AutonomyManager(
             soul_manager=soul_mgr,
-            emotion_bridge=emotion_br
+            emotion_bridge=emotion_br,
+            agent_is_working=agent_is_working
         )
         autonomy.start()
 
     # Фоновая рефлексия / консолидация памяти RAG 2.0 (если включена)
     reflection = None
     if ENABLE_REFLECTION:
-        reflection = ReflectionManager(memory_manager=memory_mgr)
+        reflection = ReflectionManager(memory_manager=memory_mgr, agent_is_working=agent_is_working)
         reflection.start()
 
     # Поток ввода с клавиатуры

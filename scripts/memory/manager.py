@@ -78,6 +78,10 @@ class MemoryManager:
 
         self.vector_engine = VectorSearchEngine()
         self._file_lock = threading.Lock()
+        # Кэш BM25-индекса, см. _bm25_search: без него КАЖДЫЙ вызов
+        # search_memory перечитывает и токенизирует содержимое ВСЕХ файлов
+        # памяти заново, хотя обычно ничего не менялось с прошлого поиска.
+        self._bm25_cache = None  # (fingerprint, BM25Okapi|None, file_paths, documents)
 
     # ---------- Вспомогательные методы ----------
     def _validate_path(self, path: str) -> str:
@@ -135,15 +139,36 @@ class MemoryManager:
         }
         return [w for w in words if len(w) > 2 and w not in stop_words]
 
-    def _bm25_search(self, query: str, top_k: int = 3) -> list:
-        """BM25 поиск по всем .md файлам (индексация на лету)."""
-        documents = []
-        file_paths = []
+    def _memory_fingerprint(self) -> tuple:
+        """
+        Дешёвый отпечаток состояния памяти: (путь, mtime) по каждому .md
+        файлу. Позволяет проверить "не изменилось ли что-то с прошлого
+        BM25-поиска" за одно перечисление файлов, не читая их содержимое.
+        """
+        fp = []
         for root, _, files in os.walk(self.base_dir):
             for file in files:
                 if not file.endswith(".md"):
                     continue
                 fpath = os.path.join(root, file)
+                try:
+                    fp.append((fpath, os.path.getmtime(fpath)))
+                except OSError:
+                    continue
+        return tuple(sorted(fp))
+
+    def _bm25_search(self, query: str, top_k: int = 3) -> list:
+        """
+        BM25 поиск по всем .md файлам. Индекс кэшируется в self._bm25_cache и
+        перестраивается только когда _memory_fingerprint() реально изменился —
+        раньше это перечитывало и токенизировало ВСЕ файлы памяти на каждый
+        вызов search_memory, что становится всё дороже по мере роста памяти.
+        """
+        fingerprint = self._memory_fingerprint()
+        if self._bm25_cache is None or self._bm25_cache[0] != fingerprint:
+            documents = []
+            file_paths = []
+            for fpath, _mtime in fingerprint:
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         content = f.read().strip()
@@ -153,11 +178,16 @@ class MemoryManager:
                 except Exception:
                     continue
 
-        if not documents:
+            bm25 = None
+            if documents:
+                tokenized_corpus = [self._tokenize_russian(doc) for doc in documents]
+                bm25 = BM25Okapi(tokenized_corpus)
+            self._bm25_cache = (fingerprint, bm25, file_paths, documents)
+
+        _fingerprint, bm25, file_paths, documents = self._bm25_cache
+        if bm25 is None:
             return []
 
-        tokenized_corpus = [self._tokenize_russian(doc) for doc in documents]
-        bm25 = BM25Okapi(tokenized_corpus)
         tokenized_query = self._tokenize_russian(query)
         if not tokenized_query:
             return []
