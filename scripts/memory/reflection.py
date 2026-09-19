@@ -17,12 +17,15 @@ from typing import Optional
 from scripts.config import (
     MEMORY_DIR,
     LLM_API_URL,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_MAX_TOKENS,
-    AUTONOMY_CHECK_INTERVAL,
-    AUTONOMY_IDLE_THRESHOLD
+    REFLECTION_CHECK_INTERVAL,
+    REFLECTION_IDLE_THRESHOLD,
+    REFLECTION_MAX_TOKENS,
+    REFLECTION_TEMPERATURE,
+    REFLECTION_MIN_FACTS,
+    REFLECTION_RECENT_FACTS_WINDOW,
 )
 from scripts.memory.manager import MemoryManager
+from scripts.agent.autonomy import get_idle_seconds
 
 
 class ReflectionManager:
@@ -31,10 +34,12 @@ class ReflectionManager:
     сохраняет рефлексивные заметки.
     """
 
-    def __init__(self, memory_manager: MemoryManager, check_interval: int = 1800, idle_threshold: int = 600):
+    def __init__(self, memory_manager: MemoryManager,
+                 check_interval: int = REFLECTION_CHECK_INTERVAL,
+                 idle_threshold: int = REFLECTION_IDLE_THRESHOLD):
         """
         :param memory_manager: экземпляр MemoryManager для чтения/записи фактов.
-        :param check_interval: интервал между проверками (сек). По умолчанию 30 минут.
+        :param check_interval: интервал между проверками (сек), см. REFLECTION_CHECK_INTERVAL в config.py.
         :param idle_threshold: минимальное время бездействия пользователя для запуска (сек).
         """
         self.mm = memory_manager
@@ -60,20 +65,6 @@ class ReflectionManager:
             self._thread.join(timeout=5)
         print("[REFLECTION] Фоновый поток рефлексии остановлен.")
 
-    def _get_idle_seconds(self) -> int:
-        """Возвращает количество секунд бездействия пользователя (Windows)."""
-        try:
-            import ctypes
-            class LASTINPUTINFO(ctypes.Structure):
-                _fields_ = [('cbSize', ctypes.c_uint), ('dwTime', ctypes.c_uint)]
-            lii = LASTINPUTINFO()
-            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-            ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
-            millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
-            return millis // 1000
-        except Exception:
-            return 0
-
     def _reflection_loop(self):
         """Основной цикл фоновой рефлексии."""
         while self._running:
@@ -81,8 +72,9 @@ class ReflectionManager:
             if not self._running:
                 break
 
-            # Проверяем бездействие пользователя
-            idle_sec = self._get_idle_seconds()
+            # Проверяем бездействие пользователя (используем ту же WinAPI
+            # проверку, что и AutonomyManager, — не дублируем её здесь).
+            idle_sec = get_idle_seconds()
             if idle_sec < self.idle_threshold:
                 continue  # пользователь активен — не беспокоим
 
@@ -124,11 +116,11 @@ class ReflectionManager:
                 except Exception:
                     continue
 
-        if len(all_facts) < 5:
+        if len(all_facts) < REFLECTION_MIN_FACTS:
             return  # слишком мало фактов для осмысленной рефлексии
 
-        # Берём последние 20 фактов (сортировка по времени в файлах не гарантирована, но хотя бы ограничим)
-        recent_facts = all_facts[-20:]
+        # Берём последние N фактов (сортировка по времени в файлах не гарантирована, но хотя бы ограничим)
+        recent_facts = all_facts[-REFLECTION_RECENT_FACTS_WINDOW:]
 
         # 2. Запрос к LLM на поиск связей
         prompt = (
@@ -145,8 +137,8 @@ class ReflectionManager:
                 LLM_API_URL,
                 json={
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 300,
-                    "temperature": 0.6,
+                    "max_tokens": REFLECTION_MAX_TOKENS,
+                    "temperature": REFLECTION_TEMPERATURE,
                     "stop": ["\n\n", "NULL"]
                 },
                 timeout=60.0

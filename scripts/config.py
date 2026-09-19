@@ -75,6 +75,24 @@ ENABLE_AUTONOMY = False            # автономные мысли в фоне
 AUTONOMY_CHECK_INTERVAL = 600      # секунд между проверками простоя
 AUTONOMY_IDLE_THRESHOLD = 300      # секунд бездействия для запуска
 
+# ==================== RAG 2.0 / РЕФЛЕКСИЯ ====================
+
+ENABLE_REFLECTION = False              # фоновая консолидация памяти (ReflectionManager)
+REFLECTION_CHECK_INTERVAL = 1800       # секунд между проверками простоя (30 мин)
+REFLECTION_IDLE_THRESHOLD = 600        # секунд бездействия для запуска рефлексии
+REFLECTION_MAX_TOKENS = 300
+REFLECTION_TEMPERATURE = 0.6
+REFLECTION_MIN_FACTS = 5               # минимум фактов в памяти, чтобы рефлексия имела смысл
+REFLECTION_RECENT_FACTS_WINDOW = 20    # сколько последних фактов анализировать за цикл
+
+# Насколько сильно свежесть факта поднимает его в выдаче поиска (0 = выключено).
+# Итоговый скор = cosine_score + RECENCY_BOOST_WEIGHT * recency_factor,
+# где recency_factor затухает экспоненциально с периодом полураспада ниже.
+# Порог релевантности (VECTOR_SEARCH_THRESHOLD) всегда проверяется по
+# «чистому» cosine_score, чтобы свежий мусор не проходил мимо фильтра.
+RECENCY_BOOST_WEIGHT = 0.05
+RECENCY_HALFLIFE_DAYS = 30
+
 # ==================== TTS ====================
 
 # (OMNIVOICE)
@@ -100,7 +118,14 @@ OMNIVOICE_ATTRIBUTES = {
     "dialect": None,             # 四川话 и т.п. (только для китайского)
 }
 
-TTS_SAMPLE_RATE = 22050
+# Silero принимает ТОЛЬКО одно из: 8000, 24000, 48000.
+# Раньше частота для apply_tts() не передавалась явно и угадывалась через
+# getattr(model, 'sample_rate', 24000), из-за чего реальная частота синтеза
+# (48000) не совпадала с частотой, на которой инициализировался pygame.mixer
+# и писался WAV (24000) — отсюда "замедленный" низкий голос при воспроизведении.
+# Теперь это единственный источник истины: используется и в apply_tts(), и в
+# pygame.mixer.init(), и в sf.write().
+SILERO_SAMPLE_RATE = 48000
 TTS_CHANNELS = 1
 TTS_BUFFER = 2048
 

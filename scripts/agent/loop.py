@@ -25,7 +25,8 @@ from scripts.config import (
     DEFAULT_REPEAT_PENALTY,
     STOP_TOKENS,
     LLM_TIMEOUT,
-    ENABLE_AUTONOMY
+    ENABLE_AUTONOMY,
+    ENABLE_REFLECTION
 )
 from scripts.agent.session import save_session, load_session, clear_session
 from scripts.agent.prompt import build_system_prompt
@@ -36,6 +37,7 @@ from scripts.agent.autonomy import AutonomyManager
 from scripts.agent.emotion import EmotionBridge
 from scripts.memory.manager import MemoryManager
 from scripts.memory.soul import SoulManager
+from scripts.memory.reflection import ReflectionManager
 from scripts.speech.stt import STTManager
 from scripts.speech.tts import TTSManager
 from scripts.tools.registry import TOOLS, build_registry
@@ -308,6 +310,12 @@ if __name__ == "__main__":
         )
         autonomy.start()
 
+    # Фоновая рефлексия / консолидация памяти RAG 2.0 (если включена)
+    reflection = None
+    if ENABLE_REFLECTION:
+        reflection = ReflectionManager(memory_manager=memory_mgr)
+        reflection.start()
+
     # Поток ввода с клавиатуры
     def keyboard_thread(q):
         while True:
@@ -358,6 +366,8 @@ if __name__ == "__main__":
     finally:
         if autonomy:
             autonomy.stop()
+        if reflection:
+            reflection.stop()
         stt_mgr.stop()
         tts_mgr.stop()
         if messages:

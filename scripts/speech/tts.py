@@ -15,7 +15,7 @@ import pygame
 import requests
 import numpy as np
 
-from scripts.config import TTS_BUFFER
+from scripts.config import TTS_BUFFER, TTS_CHANNELS, SILERO_SAMPLE_RATE
 
 
 class TTSManager:
@@ -37,7 +37,7 @@ class TTSManager:
 
         # Инициализация pygame mixer с частотой модели
         try:
-            pygame.mixer.init(frequency=self.sample_rate, size=-16, channels=1, buffer=TTS_BUFFER)
+            pygame.mixer.init(frequency=self.sample_rate, size=-16, channels=TTS_CHANNELS, buffer=TTS_BUFFER)
         except Exception as e:
             print(f"[TTS] Ошибка инициализации pygame.mixer: {e}")
             self._running = False
@@ -61,9 +61,11 @@ class TTSManager:
 
         model = torch.package.PackageImporter(local_path).load_pickle("tts_models", "model")
         model.to(self.device)
-        # Пытаемся получить частоту из модели, если есть атрибут
-        sample_rate = getattr(model, 'sample_rate', 24000)
-        return model, sample_rate
+        # ВАЖНО: частота — не свойство модели, а параметр, который передаётся
+        # в apply_tts(). Модель не хранит "свою" частоту в атрибуте, поэтому
+        # раньше здесь угадывалось значение по умолчанию, которое расходилось
+        # с реальной частотой синтеза. Используем единую константу из конфига.
+        return model, SILERO_SAMPLE_RATE
 
     def speak(self, text: str):
         if not self._running or not text:
@@ -81,8 +83,11 @@ class TTSManager:
                 continue
 
             try:
-                # Синтез через Silero
-                audio = self.model.apply_tts(text, speaker=self.speaker)
+                # Синтез через Silero. sample_rate передаём ЯВНО — это и есть
+                # частота, на которой Silero реально сгенерирует аудио, а не
+                # то, что "предполагает" плеер. Она обязана совпадать с той,
+                # на которой инициализирован pygame.mixer (см. __init__).
+                audio = self.model.apply_tts(text, speaker=self.speaker, sample_rate=self.sample_rate)
                 # Приводим к numpy (float32)
                 if hasattr(audio, 'cpu'):
                     audio = audio.cpu()
