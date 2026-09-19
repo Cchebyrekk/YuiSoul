@@ -1,0 +1,24 @@
+# Core
+requests>=2.31.0
+aiohttp>=3.9.0
+pygame>=2.5.0
+
+# Speech
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Memory & RAG
+sentence-transformers>=2.2.0
+rank-bm25>=0.2.2
+
+# System
+keyboard>=0.13.5
+pyperclip>=1.8.2
+pygetwindow>=0.0.9
+
+# Optional (WebSocket для эмоций, если понадобится)
+websocket-client>=1.6.0
+
+# Utilities
+typing-extensions>=4.8.0
