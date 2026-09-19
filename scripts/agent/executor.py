@@ -50,15 +50,16 @@ class ActionExecutor:
         self._lock = threading.Lock()
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], messages: List[Dict[str, str]],
-                           agent_is_working: threading.Event) -> tuple[List[Dict[str, str]], bool]:
+                           agent_is_working: threading.Event) -> tuple[List[Dict[str, str]], bool, bool]:
         """
         Выполняет все tool_calls из списка.
         Возвращает:
         - обновлённый список messages (с добавленными сообщениями tool)
         - флаг task_complete (True, если встретился вызов task_complete)
+        - флаг stayed_silent (True, если агент решил промолчать через stay_silent)
         """
         if not tool_calls:
-            return messages, False
+            return messages, False, False
 
         # Добавляем сообщение ассистента с tool_calls
         assistant_msg = {
@@ -69,6 +70,7 @@ class ActionExecutor:
         messages.append(assistant_msg)
 
         task_complete_flag = False
+        stayed_silent_flag = False
 
         for tc in tool_calls:
             agent_is_working.set()  # сигнал, что агент занят выполнением
@@ -89,6 +91,16 @@ class ActionExecutor:
                 # Отправляем финальную эмоцию (например, "satisfied")
                 self.emotion_bridge.send_emotion("satisfied", intensity=0.8)
                 # Не добавляем результат tool, просто выходим
+                break
+
+            # Специальная обработка stay_silent: агент осознанно решил не
+            # отвечать сейчас (по образцу #wait/#pause из kuni) — turn
+            # завершается без TTS и без видимого пользователю ответа.
+            if func_name == "stay_silent":
+                stayed_silent_flag = True
+                reason = func_args.get("reason", "не указана")
+                print(f"\n[SYSTEM] Агент решил промолчать. Причина: {reason}")
+                self.emotion_bridge.send_emotion("thinking", intensity=0.4)
                 break
 
             # Вызов функции из реестра
@@ -133,15 +145,20 @@ class ActionExecutor:
 
             agent_is_working.clear()
 
-        return messages, task_complete_flag
+        return messages, task_complete_flag, stayed_silent_flag
 
     def finalize_response(self, final_reply: str, reasoning: str,
                           messages: List[Dict[str, str]],
-                          agent_is_working: threading.Event) -> bool:
+                          agent_is_working: threading.Event,
+                          self_reported_emotion: Optional[tuple] = None) -> bool:
         """
         Обрабатывает финальный ответ агента (без инструментов).
         Сохраняет ответ в историю, озвучивает через TTS, отправляет эмоцию.
         Возвращает True, если агент должен завершить работу (например, если был пустой ответ).
+
+        :param self_reported_emotion: (emotion, intensity), извлечённые парсером из
+            тега <emotion> — если модель сама сообщила, что чувствует, это ВСЕГДА
+            приоритетнее эвристики по ключевым словам (self-report > guesswork).
         """
         # 1. Сохраняем ответ ассистента в историю (обязательно!)
         messages.append({"role": "assistant", "content": final_reply})
@@ -156,8 +173,12 @@ class ActionExecutor:
         clean_output = clean_output.replace('```', '').strip()
         if clean_output:
             print(f"\n[YUI FINAL]: {clean_output}")
-            # Отправляем эмоцию, извлечённую из текста
-            emotion, intensity = self.emotion_bridge.extract_emotion(clean_output)
+            # Эмоция: сначала доверяем самоотчёту модели (тег <emotion>),
+            # и только если его не было — эвристике по ключевым словам.
+            if self_reported_emotion:
+                emotion, intensity = self_reported_emotion
+            else:
+                emotion, intensity = self.emotion_bridge.extract_emotion(clean_output)
             if emotion != "neutral":
                 self.emotion_bridge.send_emotion(emotion, intensity)
             agent_is_working.clear()  # после озвучивания

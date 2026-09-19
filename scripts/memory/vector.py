@@ -43,6 +43,22 @@ class VectorSearchEngine:
         with open(self.meta_file, "w", encoding="utf-8") as f:
             json.dump(self.metadata, f, ensure_ascii=False, indent=2)
 
+    def remove_document(self, doc_id: str):
+        """
+        Удаляет документ из индекса (например, когда ретракция стёрла
+        последнюю строку файла и он стал пустым — иначе в индексе остаётся
+        осиротевшая запись, указывающая на текст, которого больше нет на диске).
+        Безопасно вызывать для несуществующего doc_id — это no-op.
+        """
+        if len(self.vectors) == 0:
+            return
+        existing_idx = next((i for i, m in enumerate(self.metadata) if m["id"] == doc_id), None)
+        if existing_idx is None:
+            return
+        self.vectors = np.delete(self.vectors, existing_idx, axis=0)
+        del self.metadata[existing_idx]
+        self._save_index()
+
     def add_document(self, doc_id: str, text: str):
         """
         Добавляет или обновляет документ в векторной базе.

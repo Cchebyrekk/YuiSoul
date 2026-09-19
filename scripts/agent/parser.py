@@ -61,12 +61,16 @@ class StreamParser:
                 if tc_chunk.get("function", {}).get("arguments"):
                     tc["function"]["arguments"] += tc_chunk["function"]["arguments"]
 
-    def finalize(self) -> Tuple[str, str, List[Dict[str, Any]]]:
+    def finalize(self) -> Tuple[str, str, List[Dict[str, Any]], Optional[Tuple[str, float]]]:
         """
         Завершает сборку и возвращает:
         - final_reply (очищенный текст ответа, без мыслей и тегов)
         - reasoning (текст размышлений)
         - tool_calls (список вызовов в формате OpenAI)
+        - self_reported_emotion: (emotion, intensity) из тега <emotion>любопытство, 0.7</emotion>,
+          который модель сама вписывает в ответ (по образцу kuni: эмоция как часть
+          естественного самоотчёта, а не только угадывание по ключевым словам постфактум).
+          None, если тега не было или он не распарсился.
         """
         # 1. Собираем нативные tool_calls из карты
         if self._tool_call_map:
@@ -142,7 +146,24 @@ class StreamParser:
         for pattern in preamble_patterns:
             final_reply = re.sub(pattern, '', final_reply, flags=re.DOTALL).strip()
 
-        return final_reply, reasoning, self.tool_calls
+        # 8. Самоотчёт об эмоции: <emotion>название[, интенсивность 0-1]</emotion>.
+        # Извлекаем и вырезаем ДО того, как final_reply уйдёт в TTS/печать.
+        self_reported_emotion = None
+        emotion_match = re.search(
+            r'<emotion>\s*([a-zA-Zа-яёА-ЯЁ_\-]+)\s*(?:,\s*([\d.]+))?\s*</emotion>',
+            final_reply
+        )
+        if emotion_match:
+            name = emotion_match.group(1).strip().lower()
+            try:
+                intensity = float(emotion_match.group(2)) if emotion_match.group(2) else 0.6
+            except ValueError:
+                intensity = 0.6
+            intensity = max(0.0, min(1.0, intensity))
+            self_reported_emotion = (name, intensity)
+            final_reply = re.sub(r'<emotion>.*?</emotion>', '', final_reply, flags=re.DOTALL).strip()
+
+        return final_reply, reasoning, self.tool_calls, self_reported_emotion
 
     def reset(self):
         """Сбрасывает состояние парсера для нового запроса."""
