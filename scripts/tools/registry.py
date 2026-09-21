@@ -87,14 +87,36 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "save_memory",
-            "description": "Сохранение факта в долговременную память. Сначала ищи подходящий путь через search_memory, затем сохраняй.",
+            "description": (
+                "Сохранение факта в долговременную память. Сначала ищи подходящий путь через search_memory, затем сохраняй. "
+                "Если пользователь ИСПРАВИЛ тебя и что-то, во что ты верила, оказалось неправдой — "
+                "передай confidence=-1: это удалит противоречащую запись вместо того, чтобы обе версии лежали рядом."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Путь сохранения (макс 2 уровня, английский, без .md)"},
-                    "content": {"type": "string", "description": "Текст факта"}
+                    "content": {"type": "string", "description": "Текст факта. При опровержении (confidence<=-0.5) — текст факта, который нужно удалить (не новый текст)."},
+                    "confidence": {"type": "number", "description": "-1..1. По умолчанию 0 (обычный факт/теория). -1 = опровержение, удаляет похожую старую запись. НЕ указывай для обычных фактов."}
                 },
                 "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stay_silent",
+            "description": (
+                "Промолчать в ответ на это сообщение. Ты НЕ обязана отвечать на каждое "
+                "сообщение сразу — используй, если ответ не требуется прямо сейчас, ты "
+                "ещё не решила что сказать, не в настроении, или считаешь что лучше "
+                "промолчать, чем ответить абы как. Пользователь ничего не услышит."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string", "description": "Короткая внутренняя причина молчания (не показывается пользователю)"}},
+                "required": []
             }
         }
     },
@@ -113,12 +135,12 @@ TOOLS = [
 ]
 
 
-def save_memory_handler(mm: MemoryManager, path: str, content: str) -> str:
+def save_memory_handler(mm: MemoryManager, path: str, content: str, confidence: float = 0.0) -> str:
     """
     Обёртка для вызова mm.save_fact.
     MemoryManager.save_fact уже возвращает строку с результатом (включая конфликты).
     """
-    return mm.save_fact(path, content)
+    return mm.save_fact(path, content, confidence=confidence)
 
 
 def build_registry(mm: MemoryManager) -> dict:
@@ -135,6 +157,8 @@ def build_registry(mm: MemoryManager) -> dict:
         "search_memory": lambda **kwargs: mm.search_facts(kwargs.get("query", "")),
         "save_memory": lambda **kwargs: save_memory_handler(mm,
                                                             kwargs.get("path", "misc/default"),
-                                                            kwargs.get("content", "")),
+                                                            kwargs.get("content", ""),
+                                                            confidence=float(kwargs.get("confidence", 0.0) or 0.0)),
+        "stay_silent": lambda **kwargs: f"SILENCE:{kwargs.get('reason', '')}",
         "task_complete": lambda **kwargs: f"TASK_COMPLETE:{kwargs.get('reason', '')}"
     }

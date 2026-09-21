@@ -19,9 +19,57 @@ from scripts.config import (
     AUTO_CONTEXT_MAX_CHARS,
     VECTOR_DUPLICATE_THRESHOLD,
     JACCARD_DUPLICATE_THRESHOLD,
-    VECTOR_SEARCH_THRESHOLD
+    VECTOR_SEARCH_THRESHOLD,
+    FACT_CONFIDENCE_DROP_THRESHOLD,
+    FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )
 from scripts.memory.vector import VectorSearchEngine
+
+# Необязательный маркер доверия к факту в начале строки: (c=-1.00) ... (c=0.90) ...
+# confidence по умолчанию 0.0 (теория/предположение), если маркера нет — это
+# сохраняет полную обратную совместимость со старыми файлами памяти.
+# Смысл шкалы (как в kuni): -1 = опровергнуто/ложь, 0 = теория, 1 = подтверждённая
+# истина. LLM никогда не пишет confidence=1 сама — либо 0 по умолчанию, либо явно
+# указывает низкое/отрицательное значение при исправлении/опровержении.
+_CONFIDENCE_TAG_RE = re.compile(r'^\(c=([+-]?[\d.]+)\)\s*')
+
+
+def _strip_confidence_tag(text: str) -> tuple:
+    """Возвращает (confidence: float, текст без маркера). confidence=0.0, если маркера нет."""
+    m = _CONFIDENCE_TAG_RE.match(text)
+    if not m:
+        return 0.0, text
+    try:
+        conf = float(m.group(1))
+    except ValueError:
+        return 0.0, text
+    return conf, text[m.end():]
+
+
+_FACT_LINE_RE = re.compile(r'^\[(.*?)\]\s*(?:\(c=([+-]?[\d.]+)\)\s*)?(.*)')
+
+
+def parse_fact_line(line: str):
+    """
+    Разбирает строку вида `[путь/к/факту] (c=-1) Текст факта.` — общий формат,
+    используемый и при обычном извлечении фактов (context.extract_and_save_facts),
+    и при сон-консолидации (ReflectionManager). Метка confidence опциональна.
+    Возвращает (path, confidence, text) или None, если строка не распознана
+    или текст факта пуст.
+    """
+    match = _FACT_LINE_RE.match(line)
+    if not match:
+        return None
+    path = match.group(1).strip()
+    try:
+        confidence = float(match.group(2)) if match.group(2) else 0.0
+    except ValueError:
+        confidence = 0.0
+    text = match.group(3).strip()
+    if not path or not text:
+        return None
+    return path, confidence, text
+
 
 class MemoryManager:
     def __init__(self, base_dir: str = MEMORY_DIR):
@@ -30,6 +78,10 @@ class MemoryManager:
 
         self.vector_engine = VectorSearchEngine()
         self._file_lock = threading.Lock()
+        # Кэш BM25-индекса, см. _bm25_search: без него КАЖДЫЙ вызов
+        # search_memory перечитывает и токенизирует содержимое ВСЕХ файлов
+        # памяти заново, хотя обычно ничего не менялось с прошлого поиска.
+        self._bm25_cache = None  # (fingerprint, BM25Okapi|None, file_paths, documents)
 
     # ---------- Вспомогательные методы ----------
     def _validate_path(self, path: str) -> str:
@@ -87,15 +139,36 @@ class MemoryManager:
         }
         return [w for w in words if len(w) > 2 and w not in stop_words]
 
-    def _bm25_search(self, query: str, top_k: int = 3) -> list:
-        """BM25 поиск по всем .md файлам (индексация на лету)."""
-        documents = []
-        file_paths = []
+    def _memory_fingerprint(self) -> tuple:
+        """
+        Дешёвый отпечаток состояния памяти: (путь, mtime) по каждому .md
+        файлу. Позволяет проверить "не изменилось ли что-то с прошлого
+        BM25-поиска" за одно перечисление файлов, не читая их содержимое.
+        """
+        fp = []
         for root, _, files in os.walk(self.base_dir):
             for file in files:
                 if not file.endswith(".md"):
                     continue
                 fpath = os.path.join(root, file)
+                try:
+                    fp.append((fpath, os.path.getmtime(fpath)))
+                except OSError:
+                    continue
+        return tuple(sorted(fp))
+
+    def _bm25_search(self, query: str, top_k: int = 3) -> list:
+        """
+        BM25 поиск по всем .md файлам. Индекс кэшируется в self._bm25_cache и
+        перестраивается только когда _memory_fingerprint() реально изменился —
+        раньше это перечитывало и токенизировало ВСЕ файлы памяти на каждый
+        вызов search_memory, что становится всё дороже по мере роста памяти.
+        """
+        fingerprint = self._memory_fingerprint()
+        if self._bm25_cache is None or self._bm25_cache[0] != fingerprint:
+            documents = []
+            file_paths = []
+            for fpath, _mtime in fingerprint:
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         content = f.read().strip()
@@ -105,11 +178,16 @@ class MemoryManager:
                 except Exception:
                     continue
 
-        if not documents:
+            bm25 = None
+            if documents:
+                tokenized_corpus = [self._tokenize_russian(doc) for doc in documents]
+                bm25 = BM25Okapi(tokenized_corpus)
+            self._bm25_cache = (fingerprint, bm25, file_paths, documents)
+
+        _fingerprint, bm25, file_paths, documents = self._bm25_cache
+        if bm25 is None:
             return []
 
-        tokenized_corpus = [self._tokenize_russian(doc) for doc in documents]
-        bm25 = BM25Okapi(tokenized_corpus)
         tokenized_query = self._tokenize_russian(query)
         if not tokenized_query:
             return []
@@ -120,9 +198,16 @@ class MemoryManager:
         return valid[:top_k]
 
     # ---------- Основные методы ----------
-    def save_fact(self, path: str, content: str) -> str:
+    def save_fact(self, path: str, content: str, confidence: float = 0.0) -> str:
         """
         Сохраняет факт в файл памяти с дедупликацией (векторная + Жаккард).
+
+        :param confidence: доверие к факту, см. _CONFIDENCE_TAG_RE выше.
+            confidence <= FACT_CONFIDENCE_DROP_THRESHOLD трактуется как
+            РЕТРАКЦИЯ: вместо записи новой строки ищутся и удаляются похожие
+            старые строки (это опровержение, а не новый факт) — если только
+            они не являются anchor-строками (confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD),
+            которые сон-консолидация и обычное опровержение не имеют права трогать.
         Возвращает строку статуса.
         """
         try:
@@ -133,14 +218,22 @@ class MemoryManager:
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
                 new_fact = content.strip()
-                # Векторная проверка на дубли во всей базе
-                dup_check = self.vector_engine.search(new_fact, top_k=1)
-                if dup_check and dup_check[0]['score'] > VECTOR_DUPLICATE_THRESHOLD:
-                    if dup_check[0]['id'] != validated:
-                        return "[MEMORY] ACK. Факт уже существует в памяти под другим путём."
+                is_retraction = confidence <= FACT_CONFIDENCE_DROP_THRESHOLD
+
+                if is_retraction and not os.path.exists(full_path):
+                    return "[MEMORY] Опровержение принято, но похожих фактов не найдено."
+
+                if not is_retraction:
+                    # Векторная проверка на дубли во всей базе (ретракции это не касается —
+                    # мы ищем что удалить, а не проверяем "уже есть ли такое").
+                    dup_check = self.vector_engine.search(new_fact, top_k=1)
+                    if dup_check and dup_check[0]['score'] > VECTOR_DUPLICATE_THRESHOLD:
+                        if dup_check[0]['id'] != validated:
+                            return "[MEMORY] ACK. Факт уже существует в памяти под другим путём."
 
                 lines_to_write = []
                 new_words = set(w for w in re.findall(r'\w+', new_fact.lower()) if len(w) > 2)
+                removed_count = 0
 
                 if os.path.exists(full_path):
                     with open(full_path, "r", encoding="utf-8") as f:
@@ -151,20 +244,37 @@ class MemoryManager:
                         if not clean_line:
                             continue
                         line_without_ts = re.sub(r'\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', clean_line)
-                        old_words = set(w for w in re.findall(r'\w+', line_without_ts.lower()) if len(w) > 2)
+                        old_confidence, line_without_tag = _strip_confidence_tag(line_without_ts)
+                        old_words = set(w for w in re.findall(r'\w+', line_without_tag.lower()) if len(w) > 2)
+                        is_anchor = old_confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD
+
                         if not new_words or not old_words:
                             lines_to_write.append(line)
                             continue
                         intersection = len(new_words.intersection(old_words))
                         union = len(new_words.union(old_words))
                         jaccard = intersection / union if union > 0 else 0
+
                         if jaccard >= JACCARD_DUPLICATE_THRESHOLD:
-                            continue  # пропускаем старую строку (заменяем)
+                            if is_anchor:
+                                # Anchor-факты (подтверждённая истина) неприкосновенны:
+                                # ни обычная перезапись, ни ретракция не могут их убрать.
+                                lines_to_write.append(line)
+                            else:
+                                removed_count += 1
+                                continue  # пропускаем старую строку (заменяем/удаляем)
                         else:
                             lines_to_write.append(line)
 
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                lines_to_write.append(f"- [{timestamp}] {new_fact}\n")
+                if is_retraction:
+                    # Ретракция ничего не добавляет — только удаляет похожее.
+                    status = (f"[MEMORY] Опровержение принято, удалено строк: {removed_count}."
+                              if removed_count else "[MEMORY] Опровержение принято, но похожих фактов не найдено.")
+                else:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    conf_tag = f"(c={confidence:+.2f}) " if confidence != 0.0 else ""
+                    lines_to_write.append(f"- [{timestamp}] {conf_tag}{new_fact}\n")
+                    status = "[MEMORY] OK"
 
                 with open(full_path, "w", encoding="utf-8") as f:
                     f.writelines(lines_to_write)
@@ -174,11 +284,103 @@ class MemoryManager:
                     full_content = f.read().strip()
                 if full_content:
                     self.vector_engine.add_document(doc_id=validated, text=full_content)
+                elif is_retraction:
+                    # Ретракция стёрла последнюю строку — файл опустел, индекс
+                    # должен забыть его, иначе останется ссылка на текст,
+                    # которого больше нет на диске.
+                    self.vector_engine.remove_document(validated)
 
-            return "[MEMORY] OK"
+            return status
 
         except ValueError as e:
             return f"[MEMORY ERROR] {e}"
+
+    def read_mutable_and_anchor_lines(self, path: str) -> tuple:
+        """
+        Читает файл памяти по path и делит его строки на:
+        - anchors: (confidence, text) с confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD —
+          подтверждённая истина, неприкосновенна для сон-консолидации.
+        - mutable: (confidence, text) всё остальное — можно сжимать, объединять, переписывать.
+        Используется ReflectionManager.sleep-консолидацией.
+        Возвращает (anchors, mutable) — оба списка кортежей (confidence, text).
+        Несуществующий файл — ([], []).
+        """
+        try:
+            validated = self._validate_path(path)
+        except ValueError:
+            return [], []
+        full_path = os.path.join(self.base_dir, f"{validated}.md")
+        if not os.path.exists(full_path):
+            return [], []
+
+        anchors, mutable = [], []
+        with open(full_path, "r", encoding="utf-8") as f:
+            for line in f.readlines():
+                clean_line = line.strip("- ").strip()
+                if not clean_line:
+                    continue
+                without_ts = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', clean_line)
+                confidence, text = _strip_confidence_tag(without_ts)
+                text = text.strip()
+                if not text:
+                    continue
+                if confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD:
+                    anchors.append((confidence, text))
+                else:
+                    mutable.append((confidence, text))
+        return anchors, mutable
+
+    def rewrite_mutable_lines(self, path: str, new_mutable: list) -> None:
+        """
+        Заменяет ВСЮ изменяемую (не-anchor) часть файла памяти на new_mutable —
+        список (confidence, text). Anchor-строки (confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD)
+        сохраняются как есть, консолидация их не касается. Новые строки получают
+        свежий timestamp — как и в kuni, "свежепереписанное" воспоминание снова
+        становится "недавним" для будущих циклов сна.
+        confidence всегда обрезается ниже anchor-порога: сон не имеет права
+        сама назначить факту статус подтверждённой истины.
+        Используется ReflectionManager.sleep-консолидацией.
+        """
+        try:
+            validated = self._validate_path(path)
+        except ValueError:
+            return
+        full_path = os.path.join(self.base_dir, f"{validated}.md")
+
+        with self._file_lock:
+            anchors = []
+            if os.path.exists(full_path):
+                with open(full_path, "r", encoding="utf-8") as f:
+                    for line in f.readlines():
+                        clean_line = line.strip("- ").strip()
+                        if not clean_line:
+                            continue
+                        without_ts = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', clean_line)
+                        confidence, _ = _strip_confidence_tag(without_ts)
+                        if confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD:
+                            anchors.append(line if line.endswith("\n") else line + "\n")
+
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            new_lines = []
+            for confidence, text in new_mutable:
+                text = text.strip()
+                if not text:
+                    continue
+                confidence = min(confidence, FACT_CONFIDENCE_ANCHOR_THRESHOLD - 0.01)
+                conf_tag = f"(c={confidence:+.2f}) " if confidence != 0.0 else ""
+                new_lines.append(f"- [{timestamp}] {conf_tag}{text}\n")
+
+            lines_to_write = anchors + new_lines
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.writelines(lines_to_write)
+
+            with open(full_path, "r", encoding="utf-8") as f:
+                full_content = f.read().strip()
+            if full_content:
+                self.vector_engine.add_document(doc_id=validated, text=full_content)
+            else:
+                self.vector_engine.remove_document(validated)
 
     def search_facts(self, query: str, top_k: int = 3) -> str:
         """
@@ -282,6 +484,8 @@ class MemoryManager:
             for line in lines:
                 snippet = re.sub(r'^[-*\s]+', '', line).strip()
                 snippet = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', snippet).strip()
+                _, snippet = _strip_confidence_tag(snippet)
+                snippet = snippet.strip()
                 if not snippet:
                     continue
                 snippet_words = set(w for w in re.findall(r'[a-zа-яё0-9]+', snippet.lower()) if len(w) > 2)
@@ -295,6 +499,8 @@ class MemoryManager:
                 for line in reversed(lines):
                     snippet = re.sub(r'^[-*\s]+', '', line).strip()
                     snippet = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', snippet).strip()
+                    _, snippet = _strip_confidence_tag(snippet)
+                    snippet = snippet.strip()
                     if snippet:
                         file_snippets.append(snippet)
                         break
@@ -335,6 +541,13 @@ class MemoryManager:
    - Об остальных вещах (еда, фильмы) -> ОБЯЗАТЕЛЬНО СОЗДАВАЙ НОВУЮ ПАПКУ (пример: [food/sweets] Любит трубочки).
 4. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО смешивать темы. Аксолотли НЕЛЬЗЯ класть в папку user или system. Для них всегда создается своя тема.
 5. Если фактов нет, пиши только: NULL
+6. ОПРОВЕРЖЕНИЕ: если из истории ясно, что пользователь ИСПРАВИЛ тебя, и что-то,
+   во что ты раньше верила, ОКАЗАЛОСЬ НЕПРАВДОЙ — не пиши новый факт поверх старого,
+   а ЯВНО ОПРОВЕРГНИ его меткой (c=-1) сразу после категории:
+   [user/dislikes] (c=-1) Не любит собак.
+   Это УДАЛИТ противоречащую запись из памяти вместо того, чтобы обе версии лежали
+   рядом. Используй ТОЛЬКО когда действительно есть прямое опровержение, не для
+   обычных новых фактов (у обычных фактов метки быть не должно).
 
 История:
 {hist_str}

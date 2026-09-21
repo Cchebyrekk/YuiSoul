@@ -4,6 +4,7 @@
 и саморефлексии YUI из папок memory/user/ и memory/system/yui/.
 """
 import os
+import glob
 from scripts.config import MEMORY_DIR
 
 class SoulManager:
@@ -40,15 +41,45 @@ class SoulManager:
                 break
         return "\n".join(facts).strip()
 
+    def _read_recent_reflections(self, max_files: int = 2, max_chars: int = 400) -> str:
+        """
+        Читает N последних заметок ReflectionManager из /memory/reflections/.
+        Имена файлов содержат сортируемую по времени метку
+        (reflection_YYYY-MM-DD_HH-MM.md), поэтому сортировки по имени достаточно.
+        Это и есть точка, где фоновая консолидация памяти (RAG 2.0) реально
+        влияет на поведение — иначе рефлексии просто лежат мёртвым грузом в файлах.
+        """
+        reflections_dir = os.path.join(self.base_dir, "reflections")
+        files = sorted(glob.glob(os.path.join(reflections_dir, "reflection_*.md")), reverse=True)
+
+        notes = []
+        total_len = 0
+        for fpath in files[:max_files]:
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                # Убираем markdown-заголовок "# Рефлексия от ..." — дата не нужна модели
+                content = "\n".join(
+                    line for line in content.split("\n") if not line.startswith("#")
+                ).strip().replace("- ", "")
+                if content:
+                    notes.append(content)
+                    total_len += len(content)
+                    if total_len > max_chars:
+                        break
+            except Exception:
+                continue
+        return "\n".join(notes).strip()
+
     def generate_soul_patch(self) -> str:
         """
         Анализирует структуру памяти и генерирует динамическую заплатку:
         - user_profile из /memory/user/
-        - self_reflection из /memory/system/yui/
+        - self_reflection из /memory/system/yui/ + последние заметки ReflectionManager
         """
         # 1. Профиль пользователя
         user_facts = self._read_dir_facts("user", max_chars=500)
-        
+
         # 2. Саморефлексия YUI (только файлы system/yui/yui_*.md)
         yui_facts = []
         system_dir = os.path.join(self.base_dir, "system", "yui")
@@ -67,13 +98,19 @@ class SoulManager:
                                 break
                     except Exception:
                         continue
-        
+
+        # 3. Последние выводы фоновой рефлексии (RAG 2.0 консолидация)
+        recent_reflections = self._read_recent_reflections()
+
         patch_parts = []
         if user_facts:
             patch_parts.append(f"<user_profile>\n{user_facts}\n</user_profile>")
-        if yui_facts:
-            patch_parts.append(f"<self_reflection>\n{' '.join(yui_facts)}\n</self_reflection>")
-        
+        if yui_facts or recent_reflections:
+            reflection_block = " ".join(yui_facts)
+            if recent_reflections:
+                reflection_block = f"{reflection_block}\n{recent_reflections}".strip()
+            patch_parts.append(f"<self_reflection>\n{reflection_block}\n</self_reflection>")
+
         if not patch_parts:
             return ""
         

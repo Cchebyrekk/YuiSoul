@@ -15,8 +15,9 @@ from scripts.config import (
     MEMORY_DIR,
     LLM_API_URL
 )
-from scripts.memory.manager import MemoryManager
+from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.prompt import get_dynamic_state
+from scripts.utils.http import SESSION
 
 
 def estimate_chars(messages: List[Dict[str, str]]) -> int:
@@ -105,8 +106,7 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         extraction_prompt = memory_manager.get_fact_extraction_prompt(cleaned_history, tree)
 
         try:
-            import requests
-            response = requests.post(
+            response = SESSION.post(
                 LLM_API_URL,
                 json={
                     "messages": [{"role": "user", "content": extraction_prompt}],
@@ -125,7 +125,8 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
             if not raw_facts or raw_facts.upper() == "NULL":
                 return
 
-            # Парсим строки вида [категория/путь] факт
+            # Парсим строки вида [категория/путь] (c=-1) факт — метка confidence
+            # опциональна (см. get_fact_extraction_prompt, правило 6: опровержение).
             garbage_keywords = ['анализ:', 'источник:', 'шаг:', 'формат:', 'итоговый', 'вывод:', 'факты:', 'самопроверка:']
             valid_facts = set()
             for line in raw_facts.split('\n'):
@@ -134,15 +135,15 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
                     continue
                 if any(line.lower().startswith(kw) for kw in garbage_keywords):
                     continue
-                match = re.match(r'^\[(.*?)\]\s*(.*)', line)
-                if match:
-                    path, fact = match.group(1).strip(), match.group(2).strip()
+                parsed = parse_fact_line(line)
+                if parsed:
+                    path, confidence, fact = parsed
                     if len(fact) > 5:
-                        valid_facts.add((path, fact))
+                        valid_facts.add((path, fact, confidence))
 
             saved_count = 0
-            for path, fact in valid_facts:
-                memory_manager.save_fact(path, fact)
+            for path, fact, confidence in valid_facts:
+                memory_manager.save_fact(path, fact, confidence=confidence)
                 saved_count += 1
             if saved_count > 0:
                 print(f"[SYSTEM] Факты ({saved_count} шт.) распределены.")
@@ -158,12 +159,14 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         thread.start()
 
 
-def inject_dynamic_context(user_input: str, memory_context: str = "") -> str:
+def inject_dynamic_context(user_input: str, memory_context: str = "", soul_patch: str = "") -> str:
     """
-    Инжектит в пользовательский запрос динамическое состояние (время, железо)
-    и, опционально, контекст из памяти.
+    Инжектит в пользовательский запрос динамическое состояние (время, железо,
+    статус памяти, soul patch) и, опционально, найденный контекст из памяти.
+    Всё изменчивое сюда, а не в системный промпт — см. комментарий над
+    SYSTEM_PROMPT в prompt.py про стабильность KV-кэша llama.cpp.
     """
-    dynamic_state = get_dynamic_state()
+    dynamic_state = get_dynamic_state(soul_patch=soul_patch)
     parts = [user_input]
 
     if memory_context:

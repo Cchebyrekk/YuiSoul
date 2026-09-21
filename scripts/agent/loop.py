@@ -5,7 +5,9 @@
 Запускает фоновые потоки, обрабатывает ввод из очереди (клавиатура + голос),
 выполняет итерации агента, управляет сессией.
 """
+import concurrent.futures
 import queue
+import random
 import threading
 import time
 import requests
@@ -25,8 +27,11 @@ from scripts.config import (
     DEFAULT_REPEAT_PENALTY,
     STOP_TOKENS,
     LLM_TIMEOUT,
-    ENABLE_AUTONOMY
+    ENABLE_AUTONOMY,
+    ENABLE_REFLECTION,
+    SILENCE_NUDGE_CHANCE
 )
+from scripts.utils.http import SESSION
 from scripts.agent.session import save_session, load_session, clear_session
 from scripts.agent.prompt import build_system_prompt
 from scripts.agent.context import compress_context, extract_and_save_facts, inject_dynamic_context
@@ -36,6 +41,7 @@ from scripts.agent.autonomy import AutonomyManager
 from scripts.agent.emotion import EmotionBridge
 from scripts.memory.manager import MemoryManager
 from scripts.memory.soul import SoulManager
+from scripts.memory.reflection import ReflectionManager
 from scripts.speech.stt import STTManager
 from scripts.speech.tts import TTSManager
 from scripts.tools.registry import TOOLS, build_registry
@@ -44,6 +50,18 @@ from scripts.tools.registry import TOOLS, build_registry
 # Глобальные флаги и очереди (будут созданы в __main__)
 agent_is_working = threading.Event()
 tts_active_event = threading.Event()
+
+# "Право на тишину" (по образцу processIgnoreChance из kuni): эфемерная
+# подсказка, добавляемая ТОЛЬКО в запрос к LLM (не сохраняется в messages),
+# с вероятностью SILENCE_NUDGE_CHANCE. Напоминает, что можно промолчать.
+SILENCE_NUDGE_MESSAGE = {
+    "role": "user",
+    "content": (
+        "<system_note>Кстати, ты не обязана отвечать на это прямо сейчас. Если "
+        "не хочется отвечать, ответ не нужен, или ты ещё не решила, что сказать — "
+        "можешь просто позвать stay_silent и промолчать. Это нормально.</system_note>"
+    ),
+}
 
 
 
@@ -91,14 +109,22 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
         registry = build_registry(memory_manager)
         executor = ActionExecutor(memory_manager, tts_manager, registry)
 
-    # 1. Генерируем системный промпт с учётом души
-    soul_patch = soul_manager.generate_soul_patch()
-    system_prompt = build_system_prompt(soul_patch=soul_patch)
+    # 1. Системный промпт СТАТИЧЕН (см. комментарий над prompt.SYSTEM_PROMPT) —
+    # это не зависит от soul_patch/памяти и не требует пересборки каждый ход.
+    system_prompt = build_system_prompt()
 
-    # 2. Автоматический контекст из памяти (RAG)
-    auto_mem = memory_manager.get_auto_context(user_task)
-    # Инжектируем динамическое состояние (время, железо) и память
-    user_input_final = inject_dynamic_context(user_task, auto_mem)
+    # 2. soul_patch (чтение нескольких маленьких файлов) и get_auto_context
+    # (векторный поиск — encode на CPU, самая долгая часть этой пары) друг от
+    # друга не зависят, поэтому считаем их параллельно, а не последовательно.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _prep_pool:
+        soul_future = _prep_pool.submit(soul_manager.generate_soul_patch)
+        auto_mem_future = _prep_pool.submit(memory_manager.get_auto_context, user_task)
+        soul_patch = soul_future.result()
+        auto_mem = auto_mem_future.result()
+
+    # Всё изменчивое (время, железо, статус памяти, soul patch, найденный
+    # контекст) едет в хвост — в user-сообщение, а не в системный промпт.
+    user_input_final = inject_dynamic_context(user_task, auto_mem, soul_patch=soul_patch)
 
     # 3. Загружаем или инициализируем историю
     if messages is None:
@@ -148,7 +174,14 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
             raw_reply = ""
             reasoning = ""
             tool_calls = []
+            self_reported_emotion = None
             success = False
+
+            # Решаем один раз за шаг, а не на каждую попытку: иначе ретраи
+            # после сетевой ошибки будут "перебрасывать монетку" заново.
+            silence_nudge = random.random() < SILENCE_NUDGE_CHANCE
+            if silence_nudge:
+                print("[SYSTEM] (тихая подсказка: можно промолчать, если не хочется отвечать)")
 
             for attempt in range(MAX_RETRIES):
                 agent_is_working.set()
@@ -161,9 +194,13 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                     temperature = DEEP_TEMPERATURE   # 0.6
                     max_tokens = DEEP_MAX_TOKENS     # 2048
 
+                # Подсказка про stay_silent добавляется ТОЛЬКО в этот запрос,
+                # в постоянную историю (messages) она не попадает.
+                request_messages = messages + [SILENCE_NUDGE_MESSAGE] if silence_nudge else messages
+
                 # В payload:
                 payload = {
-                    "messages": messages,
+                    "messages": request_messages,
                     "tools": TOOLS,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
@@ -175,7 +212,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 }
 
                 try:
-                    response = requests.post(LLM_API_URL, json=payload, stream=True, timeout=LLM_TIMEOUT)
+                    response = SESSION.post(LLM_API_URL, json=payload, stream=True, timeout=LLM_TIMEOUT)
                     if response.status_code != 200:
                         print(f"[ERROR] LLM вернул {response.status_code}: {response.text}")
                         agent_is_working.clear()
@@ -210,7 +247,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                     print()  # перевод строки после стрима
                     executor.flush_tts_buffer()
 
-                    final_reply, reasoning, tool_calls = parser.finalize()
+                    final_reply, reasoning, tool_calls, self_reported_emotion = parser.finalize()
                     raw_reply = final_reply
                     print(f"\n[LLM STREAM] Ответ получен.")
                     if reasoning:
@@ -235,17 +272,24 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Обработка: если есть tool_calls — выполняем
             if tool_calls:
-                messages, task_complete = executor.execute_tool_calls(tool_calls, messages, agent_is_working)
-                if task_complete:
-                    # Сохраняем факты и сессию
+                messages, task_complete, stayed_silent = executor.execute_tool_calls(tool_calls, messages, agent_is_working)
+                if task_complete or stayed_silent:
+                    # Сохраняем факты и сессию. При stay_silent пользователь просто
+                    # не получит ответа в этом ходу — это осознанный выбор агента,
+                    # а не сбой.
                     extract_and_save_facts(messages[1:], memory_manager)
                     save_session(messages)
                     return messages
                 # Иначе продолжаем цикл (следующая итерация)
                 continue
 
-            # Если tool_calls нет — финализируем ответ
-            should_exit = executor.finalize_response(raw_reply, reasoning, messages, agent_is_working)
+            # Если tool_calls нет — финализируем ответ. Эмоцию (self-report из
+            # <emotion>, либо эвристика по ключевым словам как фолбэк) executor
+            # определяет и отправляет сам — дублировать здесь не нужно.
+            should_exit = executor.finalize_response(
+                raw_reply, reasoning, messages, agent_is_working,
+                self_reported_emotion=self_reported_emotion
+            )
             if should_exit:
                 # Пустой ответ — выходим
                 extract_and_save_facts(messages[1:], memory_manager)
@@ -254,10 +298,6 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Если есть финальный ответ без инструментов — сохраняем и завершаем цикл
             if raw_reply and not tool_calls:
-                # Отправляем эмоцию, если есть
-                emotion, intensity = emotion_bridge.extract_emotion(raw_reply)
-                if emotion != "neutral":
-                    emotion_bridge.send_emotion(emotion, intensity)
                 extract_and_save_facts(messages[1:], memory_manager)
                 save_session(messages)
                 return messages
@@ -299,14 +339,23 @@ if __name__ == "__main__":
     stt_mgr = STTManager(input_queue=input_queue, agent_busy_event=agent_is_working)
     stt_mgr.start()
 
-    # Автономия (если включена)
+    # Автономия (если включена). agent_is_working передаём, чтобы фоновая
+    # мысль не отнимала слот у llama-server прямо в момент, когда основной
+    # цикл ждёт ответ на реплику пользователя.
     autonomy = None
     if ENABLE_AUTONOMY:
         autonomy = AutonomyManager(
             soul_manager=soul_mgr,
-            emotion_bridge=emotion_br
+            emotion_bridge=emotion_br,
+            agent_is_working=agent_is_working
         )
         autonomy.start()
+
+    # Фоновая рефлексия / консолидация памяти RAG 2.0 (если включена)
+    reflection = None
+    if ENABLE_REFLECTION:
+        reflection = ReflectionManager(memory_manager=memory_mgr, agent_is_working=agent_is_working)
+        reflection.start()
 
     # Поток ввода с клавиатуры
     def keyboard_thread(q):
@@ -358,6 +407,8 @@ if __name__ == "__main__":
     finally:
         if autonomy:
             autonomy.stop()
+        if reflection:
+            reflection.stop()
         stt_mgr.stop()
         tts_mgr.stop()
         if messages:
