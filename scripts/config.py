@@ -66,9 +66,17 @@ LLM_TIMEOUT = 120.0
 HTTP_READ_TIMEOUT = 120.0
 
 # Флаги
-ENABLE_AUTONOMY = False            # автономные мысли в фоне
-AUTONOMY_CHECK_INTERVAL = 600      # секунд между проверками простоя
-AUTONOMY_IDLE_THRESHOLD = 300      # секунд бездействия для запуска
+ENABLE_AUTONOMY = True            # автономные мысли в фоне
+# Простой считается от последнего обращения к Юи (реплика пользователя или конец её ответа),
+# а не по клавиатуре/мыши: за компьютером можно работать, главное — не говорить с ней.
+AUTONOMY_POLL_INTERVAL = 15        # как часто фоновый поток проверяет условия (сек)
+AUTONOMY_IDLE_THRESHOLD = 180      # сколько секунд без обращений к Юи нужно для спонтанной мысли
+AUTONOMY_MIN_INTERVAL = 600        # минимум секунд между мыслями; без ответа пользователя растёт: x2, x3...
+AUTONOMY_MAX_STEPS = 6            # шагов внутреннего хода (мысль -> поиск -> мысль -> save_memory ...)
+# Размышляя сама, Юи может искать, писать в память, смотреть на экран и говорить вслух (speak_aloud).
+# Управление ПК (печать, горячие клавиши, запуск/закрытие программ) — только если разрешено:
+# иначе она может начать печатать в окно, где пользователь сейчас работает.
+AUTONOMY_ALLOW_PC_CONTROL = False
 
 # Право на тишину (по образцу processIgnoreChance из kuni): с этой
 # вероятностью перед каждым обращением к LLM ей мягко напоминают, что она не
@@ -105,11 +113,11 @@ WEB_TIMEOUT = 15                   # секунд на поиск/загрузк
 
 # ==================== RAG 2.0 / РЕФЛЕКСИЯ ====================
 
-ENABLE_REFLECTION = False              # фоновая консолидация памяти (ReflectionManager)
-REFLECTION_CHECK_INTERVAL = 1800       # секунд между проверками простоя (30 мин)
-REFLECTION_IDLE_THRESHOLD = 600        # секунд бездействия для запуска рефлексии
-REFLECTION_MAX_TOKENS = 300
-REFLECTION_TEMPERATURE = 0.6
+ENABLE_REFLECTION = True              # фоновая консолидация памяти (ReflectionManager)
+REFLECTION_POLL_INTERVAL = 30          # как часто фоновый поток проверяет условия (сек)
+REFLECTION_IDLE_THRESHOLD = 300        # сколько секунд без обращений к Юи нужно для рефлексии
+REFLECTION_MIN_INTERVAL = 1200         # минимум секунд между циклами рефлексии (20 мин)
+REFLECTION_MAX_STEPS = 8              # шагов внутреннего хода рефлексии
 REFLECTION_MIN_FACTS = 5               # минимум фактов в памяти, чтобы рефлексия имела смысл
 REFLECTION_RECENT_FACTS_WINDOW = 20    # сколько последних фактов анализировать за цикл
 
@@ -185,6 +193,10 @@ TTS_BUFFER = 2048
 WHISPER_MODEL_SIZE = "small"          # tiny, base, small, medium, large
 WHISPER_DEVICE = "cpu"                # или "cuda" если хватит VRAM
 WHISPER_COMPUTE_TYPE = "int8"         # int8, int16, float32
+
+# Микрофон: часть имени устройства (без учёта регистра) или None — микрофон Windows по умолчанию.
+# По умолчанию Windows выбрала микрофон геймпада (Wireless Controller), который отдаёт тишину.
+STT_INPUT_DEVICE = "Fifine"
 
 STT_SAMPLERATE = 16000
 STT_BLOCK_DURATION = 0.3           # секунд на блок аудио

@@ -68,6 +68,9 @@ class ActionExecutor:
         self.registry = registry if registry is not None else build_registry(memory_manager)
         self.emotion_bridge = EmotionBridge()
         self._lock = threading.Lock()
+        # Внутренний ход (автономия/рефлексия): текст модели — мысли про себя, он не
+        # озвучивается; вслух — только через speak_aloud. None — обычный разговор.
+        self.inner_mode: Optional[str] = None
 
     def execute_tool_calls(self, tool_calls: List[Dict[str, Any]], messages: List[Dict[str, str]],
                            agent_is_working: threading.Event) -> tuple[List[Dict[str, str]], bool, bool]:
@@ -122,6 +125,21 @@ class ActionExecutor:
                 print(f"\n[SYSTEM] Агент решил промолчать. Причина: {reason}")
                 self.emotion_bridge.send_emotion("thinking", intensity=0.4)
                 break
+
+            # speak_aloud: во время размышлений про себя сказать что-то вслух
+            if func_name == "speak_aloud":
+                text = str(func_args.get("text", "")).strip()
+                spoken = speech_text(text)
+                if spoken:
+                    print(f"\n[YUI ВСЛУХ]: {spoken}")
+                    self.tts.speak(spoken)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", f"call_{len(messages)}"),
+                    "content": "Сказано вслух." if spoken else "Пустая фраза, ничего не сказано."
+                })
+                agent_is_working.clear()
+                continue
 
             # Вызов функции из реестра
             if func_name in self.registry:
@@ -209,7 +227,8 @@ class ActionExecutor:
         # 3. Извлекаем чистый текст для TTS (убираем XML-теги)
         clean_output = speech_text(final_reply)
         if clean_output:
-            print(f"\n[YUI FINAL]: {clean_output}")
+            label = f"[YUI ДУМАЕТ ({self.inner_mode})]" if self.inner_mode else "[YUI FINAL]"
+            print(f"\n{label}: {clean_output}")
             # Эмоция: сначала доверяем самоотчёту модели (тег <emotion>),
             # и только если его не было — эвристике по ключевым словам.
             if self_reported_emotion:
@@ -234,8 +253,8 @@ class ActionExecutor:
         """
         Принять очередной токен, накопить предложения и отправить в TTS.
         """
-        if not token:
-            return
+        if not token or self.inner_mode:
+            return  # мысли про себя не озвучиваются
         self._tts_buffer += token
         # Проверяем, закончилось ли предложение
         if self._tts_buffer.strip() and self._tts_buffer.strip()[-1] in '.!?':
@@ -246,7 +265,7 @@ class ActionExecutor:
 
     def flush_tts_buffer(self):
         """Отправить остаток буфера после завершения стрима."""
-        if self._tts_buffer.strip():
+        if self._tts_buffer.strip() and not self.inner_mode:
             clean = speech_text(self._tts_buffer)
             if clean:
                 self.tts.speak(clean)
