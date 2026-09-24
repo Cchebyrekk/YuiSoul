@@ -13,6 +13,7 @@ import time
 import requests
 import json
 import re
+from typing import Optional
 
 from scripts.config import (
     MAX_STEPS,
@@ -30,23 +31,26 @@ from scripts.config import (
     ENABLE_AUTONOMY,
     ENABLE_REFLECTION,
     SILENCE_NUDGE_CHANCE,
-    WILL_CHECK_ENABLED
+    WILL_CHECK_ENABLED,
+    AUTONOMY_MAX_STEPS,
+    AUTONOMY_ALLOW_PC_CONTROL,
+    REFLECTION_MAX_STEPS
 )
 from scripts.utils.http import SESSION
 from scripts.agent.session import save_session, load_session, clear_session
 from scripts.agent.prompt import build_system_prompt
 from scripts.agent.context import compress_context, extract_and_save_facts, inject_dynamic_context
 from scripts.agent.parser import StreamParser
-from scripts.agent.executor import ActionExecutor
+from scripts.agent.executor import ActionExecutor, speech_text
 from scripts.agent.will import check_willingness, will_note
-from scripts.agent.autonomy import AutonomyManager
+from scripts.agent.autonomy import AutonomyManager, mark_activity
 from scripts.agent.emotion import EmotionBridge
 from scripts.memory.manager import MemoryManager
 from scripts.memory.soul import SoulManager
 from scripts.memory.reflection import ReflectionManager
 from scripts.speech.stt import STTManager
 from scripts.speech.tts import TTSManager
-from scripts.tools.registry import TOOLS, build_registry
+from scripts.tools.registry import TOOLS, build_registry, inner_tools
 from scripts.tools.vision import strip_images
 
 
@@ -66,6 +70,17 @@ SILENCE_NUDGE_MESSAGE = {
     ),
 }
 
+
+
+# Внутренний ход: после мысли без инструментов — эфемерная подсказка продолжить или закончить.
+INNER_CONTINUE_NOTE = {
+    "role": "user",
+    "content": (
+        "<system_note>Это была твоя мысль про себя. Если хочется — продолжай: развивай её, "
+        "поищи что-то, запомни вывод, скажи что-то вслух через speak_aloud. Если мысль исчерпана — "
+        "вызови task_complete.</system_note>"
+    ),
+}
 
 
 # Ключевые слова ищутся только с начала слова (\b), а не как подстроки:
@@ -108,11 +123,17 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                    soul_manager: SoulManager = None,
                    tts_manager: TTSManager = None,
                    emotion_bridge: EmotionBridge = None,
-                   executor: ActionExecutor = None) -> list:
+                   executor: ActionExecutor = None,
+                   inner: Optional[str] = None) -> list:
     """
     Основной цикл выполнения одной задачи пользователя.
     Принимает все зависимости через параметры, чтобы быть тестируемым.
     Возвращает обновлённый список messages.
+
+    :param inner: "autonomy"/"reflection" — внутренний ход: Юи думает про себя (текст не
+        озвучивается, в истории помечен <inner_thought>), говорит вслух через speak_aloud,
+        сама решает, когда закончить (task_complete). Прерывается, как только пользователь
+        что-то сказал. Вызывающий код ставит executor.inner_mode на время хода.
     """
     if memory_manager is None:
         memory_manager = MemoryManager()
@@ -167,29 +188,40 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
     # пользователя, до всех итераций). Решение уходит в каждый запрос этого хода
     # эфемерной подсказкой, в историю не сохраняется.
     will_message = None
-    if WILL_CHECK_ENABLED:
+    if WILL_CHECK_ENABLED and not inner:  # внутренний ход — её собственная инициатива, спрашивать нечего
         agent_is_working.set()
         decision, reason = check_willingness(messages)
         agent_is_working.clear()
         print(f"[WILL] Решение: {decision}{' — ' + reason if reason else ''}")
         will_message = will_note(decision, reason)
 
+    request_tools = inner_tools(AUTONOMY_ALLOW_PC_CONTROL) if inner else TOOLS
+    continue_note = None  # внутренний ход: подсказка "продолжай думать или task_complete" (эфемерная)
+
     # 5. Основной цикл итераций
     try:
         for step in range(1, max_steps + 1):
-            print(f"\n--- ИТЕРАЦИЯ {step} ---")
+            print(f"\n--- ИТЕРАЦИЯ {step}{f' ({inner})' if inner else ''} ---")
 
             # Сжатие контекста (если нужно)
             messages = compress_context(messages, memory_manager)
 
+            # Внутренний ход уступает пользователю: заговорил — заканчиваем размышления,
+            # его реплика останется в очереди и будет обработана обычным ходом.
+            if inner and input_queue is not None and any(
+                    item[0] in ("text", "voice") for item in list(input_queue.queue)):
+                print(f"\n[INNER] Пользователь заговорил — Юи прерывает размышления ({inner}).")
+                save_session(messages)
+                return messages
+
             # Проверка очереди на новые сообщения от пользователя (интеррапты)
-            if input_queue is not None:
+            if input_queue is not None and not inner:
                 injected_texts = []
                 while not input_queue.empty():
                     try:
                         source, new_input, metadata = input_queue.get_nowait()
-                        if new_input == "EXIT":
-                            continue
+                        if new_input == "EXIT" or source not in ("text", "voice"):
+                            continue  # поставленные в очередь размышления после разговора уже не к месту
                         injected_texts.append(new_input)
                     except queue.Empty:
                         break
@@ -210,14 +242,14 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Решаем один раз за шаг, а не на каждую попытку: иначе ретраи
             # после сетевой ошибки будут "перебрасывать монетку" заново.
-            silence_nudge = random.random() < SILENCE_NUDGE_CHANCE
+            silence_nudge = not inner and random.random() < SILENCE_NUDGE_CHANCE
             if silence_nudge:
                 print("[SYSTEM] (тихая подсказка: можно промолчать, если не хочется отвечать)")
 
             for attempt in range(MAX_RETRIES):
                 agent_is_working.set()
                 # Определяем режим
-                mode = classify_request(user_task)  # или user_input_final, но лучше использовать исходный запрос
+                mode = 'deep' if inner else classify_request(user_task)
                 if mode == 'fast':
                     temperature = FAST_TEMPERATURE   # 0.1
                     max_tokens = FAST_MAX_TOKENS     # 256
@@ -227,13 +259,15 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
                 # Подсказка про stay_silent добавляется ТОЛЬКО в этот запрос,
                 # в постоянную историю (messages) она не попадает.
-                ephemeral = ([will_message] if will_message else []) + ([SILENCE_NUDGE_MESSAGE] if silence_nudge else [])
+                ephemeral = (([will_message] if will_message else [])
+                             + ([SILENCE_NUDGE_MESSAGE] if silence_nudge else [])
+                             + ([continue_note] if continue_note else []))
                 request_messages = messages + ephemeral
 
                 # В payload:
                 payload = {
                     "messages": request_messages,
-                    "tools": TOOLS,
+                    "tools": request_tools,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                     "top_k": DEFAULT_TOP_K,
@@ -304,7 +338,17 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Обработка: если есть tool_calls — выполняем
             if tool_calls:
+                assistant_idx = len(messages)
                 messages, task_complete, stayed_silent = executor.execute_tool_calls(tool_calls, messages, agent_is_working)
+                # Текст, написанный вместе с вызовом инструмента, раньше терялся (content=""):
+                # в обычном ходе это сказанное вслух, во внутреннем — сама мысль.
+                if raw_reply.strip() and assistant_idx < len(messages):
+                    thought = re.sub(r'</?inner_thought>', '', raw_reply).strip()
+                    messages[assistant_idx]["content"] = (
+                        f"<inner_thought>{thought}</inner_thought>" if inner else raw_reply)
+                    if inner:
+                        print(f"\n[YUI ДУМАЕТ ({inner})]: {speech_text(raw_reply)}")
+                continue_note = None
                 if task_complete or stayed_silent:
                     # Сохраняем факты и сессию. При stay_silent пользователь просто
                     # не получит ответа в этом ходу — это осознанный выбор агента,
@@ -328,6 +372,20 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 save_session(messages)
                 return messages
 
+            if inner:
+                # Мысль без инструментов: помечаем её как мысль про себя (чтобы потом не путать
+                # со сказанным пользователю). Первая такая мысль — ещё не конец: даём подумать
+                # дальше. Вторая подряд без действий — размышление исчерпано (модель часто
+                # пишет "можно завершать" текстом вместо task_complete).
+                thought = re.sub(r'</?inner_thought>', '', raw_reply).strip()
+                messages[-1]["content"] = f"<inner_thought>{thought}</inner_thought>"
+                if continue_note is not None:
+                    extract_and_save_facts(messages[1:], memory_manager)
+                    save_session(messages)
+                    return messages
+                continue_note = INNER_CONTINUE_NOTE
+                continue
+
             # Если есть финальный ответ без инструментов — сохраняем и завершаем цикл
             if raw_reply and not tool_calls:
                 extract_and_save_facts(messages[1:], memory_manager)
@@ -335,7 +393,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 return messages
 
         # Если цикл завершился по максимуму шагов
-        print("[SYSTEM] Достигнут лимит шагов, завершаю.")
+        print(f"[SYSTEM] Достигнут лимит шагов{f' ({inner})' if inner else ''}, завершаю.")
         extract_and_save_facts(messages[1:], memory_manager)
         save_session(messages)
         return messages
@@ -371,22 +429,23 @@ if __name__ == "__main__":
     stt_mgr = STTManager(input_queue=input_queue, agent_busy_event=agent_is_working)
     stt_mgr.start()
 
-    # Автономия (если включена). agent_is_working передаём, чтобы фоновая
-    # мысль не отнимала слот у llama-server прямо в момент, когда основной
-    # цикл ждёт ответ на реплику пользователя.
+    # Автономия (если включена). agent_is_working/tts_active_event передаём, чтобы
+    # фоновая мысль не отнимала слот у llama-server и не перебивала Юи на полуслове.
+    # Готовая мысль возвращается через input_queue — историю меняет только основной поток.
     autonomy = None
     if ENABLE_AUTONOMY:
         autonomy = AutonomyManager(
-            soul_manager=soul_mgr,
-            emotion_bridge=emotion_br,
-            agent_is_working=agent_is_working
+            input_queue=input_queue,
+            agent_is_working=agent_is_working,
+            tts_active=tts_active_event
         )
         autonomy.start()
 
     # Фоновая рефлексия / консолидация памяти RAG 2.0 (если включена)
     reflection = None
     if ENABLE_REFLECTION:
-        reflection = ReflectionManager(memory_manager=memory_mgr, agent_is_working=agent_is_working)
+        reflection = ReflectionManager(memory_manager=memory_mgr, input_queue=input_queue,
+                                       agent_is_working=agent_is_working)
         reflection.start()
 
     # Поток ввода с клавиатуры
@@ -406,7 +465,14 @@ if __name__ == "__main__":
     kb_thread = threading.Thread(target=keyboard_thread, args=(input_queue,), daemon=True)
     kb_thread.start()
 
-    messages = None
+    # Прошлую сессию грузим сразу, а не на первой реплике: размышлениям Юи нужна
+    # история уже до того, как пользователь что-то скажет.
+    messages = load_session()
+    if messages:
+        print("[SYSTEM] Обнаружена предыдущая сессия. Восстановление...")
+        messages[0]["content"] = build_system_prompt()  # в файле мог остаться старый промпт
+    inner_managers = {"autonomy": autonomy, "reflection": reflection}
+    inner_max_steps = {"autonomy": AUTONOMY_MAX_STEPS, "reflection": REFLECTION_MAX_STEPS}
     try:
         print("\n[YUI SYSTEM] Агент запущен. Пиши текст или говори в микрофон.")
 
@@ -414,6 +480,37 @@ if __name__ == "__main__":
             source, user_input, metadata = input_queue.get()
             if user_input == "EXIT":
                 break
+
+            if source in inner_managers:
+                # Внутренний ход: Юи размышляет сама (автономия/рефлексия) — в несколько шагов,
+                # с инструментами; мысли видны в консоли, вслух — только speak_aloud.
+                # Активностью пользователя это не считается.
+                manager = inner_managers[source]
+                if manager is None or not manager.is_due():
+                    continue  # пока задача ждала в очереди, пользователь успел заговорить
+                print(f"\n[YUI INNER: {source}] Юи размышляет сама...")
+                executor.inner_mode = source
+                try:
+                    messages = run_agent_loop(
+                        user_task=user_input,
+                        messages=messages,
+                        max_steps=inner_max_steps[source],
+                        input_queue=input_queue,
+                        memory_manager=memory_mgr,
+                        soul_manager=soul_mgr,
+                        tts_manager=tts_mgr,
+                        emotion_bridge=emotion_br,
+                        executor=executor,
+                        inner=source
+                    )
+                finally:
+                    executor.inner_mode = None
+                print(f"[YUI INNER: {source}] Размышления закончены.")
+                continue
+
+            mark_activity()
+            if autonomy:
+                autonomy.on_user_activity()
 
             # Если это голосовой интеррапт – добавляем пометку
             if metadata.get("interrupted"):
@@ -433,6 +530,7 @@ if __name__ == "__main__":
                 emotion_bridge=emotion_br,
                 executor=executor
             )
+            mark_activity()  # отсчёт тишины — с конца ответа Юи, а не с момента вопроса
 
     except Exception as e:
         print(f"\n[SYSTEM FATAL] Падение основного цикла: {e}")

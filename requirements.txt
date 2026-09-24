@@ -4,6 +4,8 @@ aiohttp>=3.9.0
 pygame>=2.5.0
 
 # Speech
+torch>=2.0.0                # Silero TTS; для CUDA ставить с https://pytorch.org
+soundfile>=0.12.0           # запись wav для TTS
 faster-whisper>=1.0.0
 sounddevice>=0.4.6
 numpy>=1.24.0

@@ -1,81 +1,90 @@
 # -*- coding: utf-8 -*-
 """
-Модуль автономных действий (спонтанные мысли при бездействии пользователя).
-Периодически проверяет, не ушёл ли пользователь, и если да — генерирует
-внутренний монолог, отправляет его в TTS и/или в эмоциональный канал.
+Модуль автономных действий (Юи думает сама, когда к ней давно не обращались).
+Фоновый поток только решает, КОГДА пора: сколько прошло с последнего обращения
+к Юи и с прошлой мысли. Сама мысль — это внутренний ход основного цикла
+(run_agent_loop с inner="autonomy"): Юи размышляет в несколько шагов, может
+искать в интернете, писать в память и говорить вслух через speak_aloud.
 """
+import queue
 import threading
 import time
-import datetime
-import ctypes
-import requests
-import re
 
 from scripts.config import (
-    ENABLE_AUTONOMY,
-    AUTONOMY_CHECK_INTERVAL,
+    AUTONOMY_POLL_INTERVAL,
     AUTONOMY_IDLE_THRESHOLD,
-    LLM_API_URL,
-    DEEP_TEMPERATURE,
-    DEEP_MAX_TOKENS
+    AUTONOMY_MIN_INTERVAL,
 )
-from scripts.memory.soul import SoulManager
-from scripts.agent.emotion import EmotionBridge
-from scripts.utils.http import SESSION
 
 
-# Структура для получения времени бездействия (Windows API)
-class LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [
-        ('cbSize', ctypes.c_uint),
-        ('dwTime', ctypes.c_uint)
-    ]
+# ==================== Время с последнего обращения к Юи ====================
+# Простой считается не по клавиатуре/мыши (пользователь может спокойно работать
+# за компьютером), а по разговору: основной цикл отмечает активность, когда
+# пользователь что-то сказал/написал и когда Юи закончила отвечать.
+
+_last_activity = time.monotonic()
 
 
-def get_idle_seconds() -> int:
-    """Возвращает количество секунд бездействия пользователя (Windows)."""
-    try:
-        lii = LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
-        millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
-        return millis // 1000
-    except Exception:
-        return 0
+def mark_activity():
+    """Отметить обращение к Юи (ввод пользователя или конец её ответа)."""
+    global _last_activity
+    _last_activity = time.monotonic()
+
+
+def seconds_since_activity() -> float:
+    """Сколько секунд к Юи никто не обращался."""
+    return time.monotonic() - _last_activity
+
+
+AUTONOMY_PROMPT = (
+    "<system_event>Пользователь не обращался к тебе уже {minutes} мин. — может, занят своим делом "
+    "за компьютером или отошёл. Это время для тебя самой. Подумай про себя о том, что тебе сейчас "
+    "интересно: недавний разговор, пользователь, ты сама, что-то из мира.\n"
+    "Всё, что ты пишешь текстом, — мысли про себя, их никто не слышит. Можешь думать в несколько шагов:\n"
+    "- хочется что-то узнать или проверить — поищи (search_web, read_webpage) или загляни в память (search_memory);\n"
+    "- поняла что-то стоящее о пользователе, о себе или о мире — запомни (save_memory);\n"
+    "- захочется что-то сказать или спросить вслух — speak_aloud.\n"
+    "Не повторяй то, о чём уже думала. Когда мысль исчерпана — вызови task_complete.</system_event>"
+)
 
 
 class AutonomyManager:
     """
-    Менеджер автономных спонтанных мыслей.
-    Запускается в фоновом потоке.
+    Решает, когда Юи пора подумать самой, и ставит внутренний ход в очередь основного цикла.
     """
 
     def __init__(self,
-                 check_interval: int = AUTONOMY_CHECK_INTERVAL,
+                 input_queue: queue.Queue,
+                 agent_is_working: threading.Event = None,
+                 tts_active: threading.Event = None,
                  idle_threshold: int = AUTONOMY_IDLE_THRESHOLD,
-                 soul_manager: SoulManager = None,
-                 emotion_bridge: EmotionBridge = None,
-                 agent_is_working: threading.Event = None):
+                 min_interval: int = AUTONOMY_MIN_INTERVAL):
         """
-        :param check_interval: интервал проверки бездействия (сек).
-        :param idle_threshold: минимальное время бездействия для запуска (сек).
-        :param soul_manager: экземпляр SoulManager для генерации пайча.
-        :param emotion_bridge: экземпляр EmotionBridge для отправки эмоций.
-        :param agent_is_working: событие основного цикла. Если установлено —
-            фоновая мысль не отправляет запрос к LLM в этот раз: у llama-server
-            ограниченное число слотов, и интерактивный ответ пользователю важнее
-            спонтанной мысли. Idle-проверка сама по себе (по клавиатуре/мыши)
-            этого не гарантирует — пользователь может активно говорить голосом,
-            почти не трогая клавиатуру/мышь.
+        :param input_queue: очередь основного цикла — туда уходит ("autonomy", промпт, метаданные).
+        :param agent_is_working: событие основного цикла — пока Юи отвечает, не планируем мысль.
+        :param tts_active: событие TTS — пока Юи говорит, тоже ждём.
+        :param idle_threshold: сколько секунд без обращений к Юи нужно для мысли.
+        :param min_interval: минимум секунд между мыслями.
         """
-        self.check_interval = check_interval
-        self.idle_threshold = idle_threshold
-        self.soul_manager = soul_manager if soul_manager else SoulManager()
-        self.emotion_bridge = emotion_bridge if emotion_bridge else EmotionBridge()
+        self.input_queue = input_queue
         self.agent_is_working = agent_is_working
+        self.tts_active = tts_active
+        self.idle_threshold = idle_threshold
+        self.min_interval = min_interval
+
+        self._last_thought = 0.0
+        self._unanswered = 0  # внутренних ходов подряд без ответа пользователя — каждый следующий реже
 
         self._running = False
         self._thread: threading.Thread | None = None
+
+    def on_user_activity(self):
+        """Пользователь заговорил — снова можно думать с обычной частотой."""
+        self._unanswered = 0
+
+    def is_due(self) -> bool:
+        """Основной цикл перепроверяет это перед запуском: пока задача ждала в очереди, пользователь мог заговорить."""
+        return seconds_since_activity() >= self.idle_threshold
 
     def start(self):
         """Запускает фоновый поток автономии."""
@@ -84,7 +93,8 @@ class AutonomyManager:
         self._running = True
         self._thread = threading.Thread(target=self._autonomy_loop, daemon=True)
         self._thread.start()
-        print("[AUTONOMY] Фоновый процесс инициализирован.")
+        print(f"[AUTONOMY] Запущено: размышление после {self.idle_threshold} с без обращений, "
+              f"не чаще раза в {self.min_interval} с.")
 
     def stop(self):
         """Останавливает фоновый поток."""
@@ -93,73 +103,26 @@ class AutonomyManager:
             self._thread.join(timeout=2)
         print("[AUTONOMY] Остановлен.")
 
+    def _busy(self) -> bool:
+        return ((self.agent_is_working is not None and self.agent_is_working.is_set())
+                or (self.tts_active is not None and self.tts_active.is_set()))
+
     def _autonomy_loop(self):
-        """Основной цикл: проверка бездействия и генерация мыслей."""
+        """Ждём паузы в разговоре и ставим внутренний ход в очередь."""
         while self._running:
-            time.sleep(self.check_interval)
+            time.sleep(AUTONOMY_POLL_INTERVAL)
             if not self._running:
                 break
 
-            idle_sec = get_idle_seconds()
-            if idle_sec < self.idle_threshold:
+            # Без ответа пользователя каждое следующее размышление ждёт дольше: 1x, 2x, 3x... интервала
+            interval = self.min_interval * (1 + self._unanswered)
+            if not self.is_due() or time.monotonic() - self._last_thought < interval:
+                continue
+            if self._busy():
                 continue
 
-            if self.agent_is_working is not None and self.agent_is_working.is_set():
-                # Основной цикл прямо сейчас занят LLM (может быть голосовой
-                # разговор без активности клавиатуры/мыши). Не лезем со
-                # спонтанной мыслью — не отнимаем слот у интерактивного ответа.
-                continue
-
-            # Пользователь бездействует — генерируем мысль
-            idle_min = idle_sec // 60
-            time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # Получаем актуальный soul_patch
-            soul_patch = self.soul_manager.generate_soul_patch()
-            if not soul_patch:
-                soul_patch = "<user_profile>Нет данных о пользователе.</user_profile>"
-
-            # Формируем запрос к LLM
-            prompt = (
-                f"Текущее время: {time_str}. Пользователь неактивен {idle_min} минут.\n"
-                f"{soul_patch}\n"
-                f"У тебя есть спонтанное желание высказаться или подумать вслух в одиночестве? "
-                f"Если да — напиши короткую мысль в тегах <thought> и <output>. Если нет — пиши только NULL."
-            )
-
-            try:
-                response = SESSION.post(
-                    LLM_API_URL,
-                    json={
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 150,
-                        "temperature": DEEP_TEMPERATURE,
-                        "stop": ["\n\n", "NULL"]
-                    },
-                    timeout=30.0
-                )
-
-                if response.status_code != 200:
-                    continue
-
-                raw_reply = response.json()["choices"][0]["message"]["content"].strip()
-                if not raw_reply or raw_reply.upper() == "NULL":
-                    continue
-
-                # Очищаем от тегов
-                raw_reply = re.sub(r'<thought>.*?</thought>', '', raw_reply, flags=re.DOTALL).strip()
-                raw_reply = raw_reply.replace("<output>", "").replace("</output>", "").strip()
-
-                if len(raw_reply) > 10:
-                    print(f"\n[YUI AUTONOMOUS] ({idle_min} мин. тишины) {raw_reply}\n")
-                    # Отправляем эмоцию (например, "thinking" или "neutral")
-                    emotion, intensity = self.emotion_bridge.extract_emotion(raw_reply)
-                    self.emotion_bridge.send_emotion(emotion, intensity)
-
-                    # Опционально: можно озвучить через TTS, но лучше пока просто логировать
-                    # self.tts.speak(raw_reply)  # если передать TTS в конструктор
-
-            except requests.exceptions.RequestException:
-                pass
-            except Exception as e:
-                print(f"[AUTONOMY ERROR] {e}")
+            self._last_thought = time.monotonic()
+            self._unanswered += 1
+            idle_min = int(seconds_since_activity() // 60)
+            self.input_queue.put(("autonomy", AUTONOMY_PROMPT.format(minutes=idle_min),
+                                  {"timestamp": time.time(), "idle_min": idle_min}))

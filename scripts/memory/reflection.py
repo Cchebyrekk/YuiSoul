@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Модуль фоновой рефлексии (RAG 2.0).
-Периодически анализирует память, строит связи между фактами,
-генерирует "внутренние монологи" и сохраняет их в memory/reflections/.
-Использует отдельный поток и не блокирует основной цикл агента.
+В паузах разговора ставит в очередь основного цикла внутренний ход рефлексии:
+Юи думает над свежими фактами в несколько шагов, с инструментами (поиск, память,
+speak_aloud) и сама сохраняет выводы через save_memory. Раз в N циклов —
+фоновая сон-консолидация памяти.
 """
 import os
-import json
+import queue
 import random
 import threading
 import time
-import datetime
 import re
 import requests
 from typing import Optional
@@ -18,10 +18,9 @@ from typing import Optional
 from scripts.config import (
     MEMORY_DIR,
     LLM_API_URL,
-    REFLECTION_CHECK_INTERVAL,
+    REFLECTION_POLL_INTERVAL,
     REFLECTION_IDLE_THRESHOLD,
-    REFLECTION_MAX_TOKENS,
-    REFLECTION_TEMPERATURE,
+    REFLECTION_MIN_INTERVAL,
     REFLECTION_MIN_FACTS,
     REFLECTION_RECENT_FACTS_WINDOW,
     ENABLE_SLEEP_CONSOLIDATION,
@@ -33,7 +32,7 @@ from scripts.config import (
     FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )
 from scripts.memory.manager import MemoryManager, parse_fact_line
-from scripts.agent.autonomy import get_idle_seconds
+from scripts.agent.autonomy import seconds_since_activity
 from scripts.utils.http import SESSION
 
 
@@ -73,32 +72,54 @@ confidence ∈ [-1..1]: -1 = опровергнуто/ложь (такие фа�
 """
 
 
+REFLECTION_PROMPT = (
+    "<system_event>Время рефлексии. Вот самые свежие факты из твоей памяти:\n{facts}\n\n"
+    "Подумай про себя: какие между ними связи и противоречия, что из этого следует для тебя и для "
+    "ваших отношений с пользователем, чего ты не знаешь и что хотела бы уточнить. "
+    "Всё, что ты пишешь текстом, — мысли про себя, их никто не слышит. Можешь думать в несколько шагов:\n"
+    "- стоит что-то проверить или узнать — поищи (search_web, read_webpage) или загляни в память (search_memory);\n"
+    "- важные выводы сохрани через save_memory: о себе — в system/yui/yui_character или "
+    "system/yui/yui_preferences, о пользователе — в user/..., общие наблюдения — в reflections/reflection_notes; "
+    "если факт оказался неверным — сохрани исправление с отрицательным confidence;\n"
+    "- захочется что-то сказать или спросить вслух — speak_aloud.\n"
+    "Когда закончишь — вызови task_complete.</system_event>"
+)
+
+
 class ReflectionManager:
     """
-    Управляет фоновой рефлексией: анализирует память, генерирует связи,
-    сохраняет рефлексивные заметки.
+    Решает, когда Юи пора поразмышлять над памятью, и ставит внутренний ход в очередь
+    основного цикла (run_agent_loop с inner="reflection"). Раз в N циклов — фоновая
+    сон-консолидация памяти (отдельный LLM-запрос без инструментов).
     """
 
     def __init__(self, memory_manager: MemoryManager,
-                 check_interval: int = REFLECTION_CHECK_INTERVAL,
+                 input_queue: queue.Queue,
+                 min_interval: int = REFLECTION_MIN_INTERVAL,
                  idle_threshold: int = REFLECTION_IDLE_THRESHOLD,
                  agent_is_working: threading.Event = None):
         """
         :param memory_manager: экземпляр MemoryManager для чтения/записи фактов.
-        :param check_interval: интервал между проверками (сек), см. REFLECTION_CHECK_INTERVAL в config.py.
-        :param idle_threshold: минимальное время бездействия пользователя для запуска (сек).
-        :param agent_is_working: событие основного цикла — если установлено, рефлексия
-            и сон-консолидация пропускают свой LLM-запрос в этот раз, чтобы не отнимать
-            слот у llama-server прямо в момент интерактивного ответа (см. AutonomyManager).
+        :param input_queue: очередь основного цикла — туда уходит ("reflection", промпт, метаданные).
+        :param min_interval: минимум секунд между циклами рефлексии, см. REFLECTION_MIN_INTERVAL в config.py.
+        :param idle_threshold: сколько секунд к Юи не должны обращаться, чтобы начать (сек).
+        :param agent_is_working: событие основного цикла — пока оно установлено, не планируем
+            рефлексию и не запускаем сон-консолидацию (у llama-server один слот).
         """
         self.mm = memory_manager
-        self.check_interval = check_interval
+        self.input_queue = input_queue
+        self.min_interval = min_interval
         self.idle_threshold = idle_threshold
+        self._last_cycle = 0.0
         self.agent_is_working = agent_is_working
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._cycle_count = 0
+
+    def is_due(self) -> bool:
+        """Основной цикл перепроверяет это перед запуском: пока задача ждала в очереди, пользователь мог заговорить."""
+        return seconds_since_activity() >= self.idle_threshold
 
     def start(self):
         """Запускает фоновый поток рефлексии."""
@@ -107,7 +128,8 @@ class ReflectionManager:
         self._running = True
         self._thread = threading.Thread(target=self._reflection_loop, daemon=True)
         self._thread.start()
-        print("[REFLECTION] Фоновый поток рефлексии запущен.")
+        print(f"[REFLECTION] Запущено: после {self.idle_threshold} с без обращений к Юи, "
+              f"не чаще раза в {self.min_interval} с.")
 
     def stop(self):
         """Останавливает фоновый поток."""
@@ -119,22 +141,23 @@ class ReflectionManager:
     def _reflection_loop(self):
         """Основной цикл фоновой рефлексии."""
         while self._running:
-            time.sleep(self.check_interval)
+            time.sleep(REFLECTION_POLL_INTERVAL)
             if not self._running:
                 break
 
-            # Проверяем бездействие пользователя (используем ту же WinAPI
-            # проверку, что и AutonomyManager, — не дублируем её здесь).
-            idle_sec = get_idle_seconds()
-            if idle_sec < self.idle_threshold:
-                continue  # пользователь активен — не беспокоим
+            # Простой — это пауза в разговоре с Юи (см. autonomy.seconds_since_activity),
+            # а не бездействие за компьютером.
+            if not self.is_due():
+                continue
+            if time.monotonic() - self._last_cycle < self.min_interval:
+                continue
 
             if self.agent_is_working is not None and self.agent_is_working.is_set():
                 continue  # основной цикл сейчас держит LLM — не мешаем
 
-            # Запускаем один цикл рефлексии
+            self._last_cycle = time.monotonic()
             try:
-                self._run_reflection_cycle()
+                self._queue_reflection()
             except Exception as e:
                 print(f"[REFLECTION ERROR] {e}")
 
@@ -151,14 +174,8 @@ class ReflectionManager:
                 except Exception as e:
                     print(f"[REFLECTION] sleep_consolidation error: {e}")
 
-    def _run_reflection_cycle(self):
-        """
-        Выполняет один цикл рефлексии:
-        1. Получает список недавних фактов (из памяти).
-        2. Отправляет запрос LLM для поиска связей.
-        3. Сохраняет новые рефлексивные заметки.
-        """
-        # 1. Собираем факты из всех файлов памяти (кроме папки reflections)
+    def _recent_facts(self) -> list:
+        """Самые свежие факты из памяти (кроме папки reflections), по дате записи."""
         all_facts = []
         for root, _, files in os.walk(self.mm.base_dir):
             # Игнорируем папку reflections, чтобы не читать свои же заметки
@@ -167,99 +184,31 @@ class ReflectionManager:
             for file in files:
                 if not file.endswith(".md"):
                     continue
-                fpath = os.path.join(root, file)
                 try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                    if content:
-                        # Извлекаем только строки фактов (начинаются с "- [дата]")
-                        for line in content.split('\n'):
-                            line = line.strip()
-                            if line.startswith("- ["):
-                                # Убираем дату и маркер
-                                fact = re.sub(r'^-\s*\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', line).strip()
-                                if fact:
-                                    all_facts.append(fact)
+                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                        content = f.read()
                 except Exception:
                     continue
+                # Строки фактов: "- [2026-09-24 21:30] (c=0.30) текст"
+                for line in content.split('\n'):
+                    match = re.match(r'^-\s*\[(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})\]\s*(.+)$', line.strip())
+                    if match:
+                        all_facts.append((match.group(1), match.group(2).strip()))
+        all_facts.sort(key=lambda item: item[0])
+        return [fact for _, fact in all_facts[-REFLECTION_RECENT_FACTS_WINDOW:]]
 
-        if len(all_facts) < REFLECTION_MIN_FACTS:
-            return  # слишком мало фактов для осмысленной рефлексии
-
-        # Берём последние N фактов (сортировка по времени в файлах не гарантирована, но хотя бы ограничим)
-        recent_facts = all_facts[-REFLECTION_RECENT_FACTS_WINDOW:]
-
-        # 2. Запрос к LLM на поиск связей
-        prompt = (
-            "Ты — внутренний голос YUI. Проанализируй следующие факты из моей памяти "
-            "и найди между ними неочевидные связи, противоречия или выводы, которые могут "
-            "повлиять на моё поведение. Сформулируй 1-3 рефлексивные заметки в виде коротких "
-            "утверждений. Если связи очевидны или их нет, напиши NULL.\n\n"
-            "Факты:\n" + "\n".join(f"- {f}" for f in recent_facts) + "\n\n"
-            "Рефлексия (только заметки, без пояснений):"
-        )
-
-        try:
-            response = SESSION.post(
-                LLM_API_URL,
-                json={
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": REFLECTION_MAX_TOKENS,
-                    "temperature": REFLECTION_TEMPERATURE,
-                    "stop": ["\n\n", "NULL"]
-                },
-                timeout=60.0
-            )
-            if response.status_code != 200:
-                print(f"[REFLECTION] LLM ответил с ошибкой: {response.status_code}")
-                return
-
-            raw = response.json()["choices"][0]["message"]["content"].strip()
-            if not raw or raw.upper() == "NULL":
-                return
-
-            # Очищаем от лишнего
-            lines = [re.sub(r'^[\d\)\-\*]\s*', '', line).strip() for line in raw.split('\n') if line.strip()]
-            if not lines:
-                return
-
-            # 3. Сохраняем рефлексивные заметки в memory/reflections/
-            reflections_dir = os.path.join(self.mm.base_dir, "reflections")
-            os.makedirs(reflections_dir, exist_ok=True)
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            filename = f"reflection_{timestamp}.md"
-            filepath = os.path.join(reflections_dir, filename)
-
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(f"# Рефлексия от {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
-                for line in lines:
-                    f.write(f"- {line}\n")
-
-            # Обновляем векторный индекс для нового файла (чтобы он участвовал в поиске)
-            with open(filepath, "r", encoding="utf-8") as f:
-                full_content = f.read().strip()
-            if full_content:
-                # doc_id – относительный путь без расширения
-                rel_path = os.path.relpath(filepath, self.mm.base_dir).replace("\\", "/")
-                if rel_path.endswith(".md"):
-                    rel_path = rel_path[:-3]
-                self.mm.vector_engine.add_document(doc_id=rel_path, text=full_content)
-
-            print(f"[REFLECTION] Сохранена рефлексия: {filename} ({len(lines)} заметок)")
-
-        except requests.exceptions.RequestException as e:
-            print(f"[REFLECTION] Ошибка HTTP: {e}")
-        except Exception as e:
-            print(f"[REFLECTION] Ошибка: {e}")
+    def _queue_reflection(self):
+        """Ставит внутренний ход рефлексии в очередь основного цикла."""
+        facts = self._recent_facts()
+        if len(facts) < REFLECTION_MIN_FACTS:
+            print(f"[REFLECTION] Пропуск: в памяти {len(facts)} фактов, нужно хотя бы {REFLECTION_MIN_FACTS}.")
+            return
+        prompt = REFLECTION_PROMPT.format(facts="\n".join(f"- {f}" for f in facts))
+        self.input_queue.put(("reflection", prompt, {"timestamp": time.time(), "facts": len(facts)}))
 
     def force_reflection(self):
-        """Принудительно запускает один цикл рефлексии (для ручного вызова)."""
-        if not self._running:
-            print("[REFLECTION] Поток не запущен, выполняю синхронно...")
-            self._run_reflection_cycle()
-        else:
-            # Можно запустить в отдельном потоке, но чтобы не блокировать, лучше через очередь
-            threading.Thread(target=self._run_reflection_cycle, daemon=True).start()
+        """Поставить рефлексию в очередь прямо сейчас (для ручного вызова)."""
+        self._queue_reflection()
 
     # ==================== СОН-КОНСОЛИДАЦИЯ (RAG 2.0) ====================
 
@@ -351,13 +300,14 @@ class ReflectionManager:
                     ],
                     "max_tokens": SLEEP_CONSOLIDATION_MAX_TOKENS,
                     "temperature": SLEEP_CONSOLIDATION_TEMPERATURE,
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
                 timeout=120.0,
             )
             if response.status_code != 200:
                 print(f"[REFLECTION] sleep_consolidation: LLM ответил {response.status_code}")
                 return
-            raw = response.json()["choices"][0]["message"]["content"].strip()
+            raw = (response.json()["choices"][0]["message"].get("content") or "").strip()
         except requests.exceptions.RequestException as e:
             print(f"[REFLECTION] sleep_consolidation: ошибка HTTP: {e}")
             return

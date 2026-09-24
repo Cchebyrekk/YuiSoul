@@ -14,12 +14,27 @@ from scripts.config import (
     WHISPER_MODEL_SIZE,
     WHISPER_DEVICE,
     WHISPER_COMPUTE_TYPE,
+    STT_INPUT_DEVICE,
     STT_SAMPLERATE,
     STT_BLOCK_DURATION,
     STT_SILENCE_BLOCKS,
     STT_VOLUME_THRESHOLD,
     STT_MIN_AUDIO_LENGTH
 )
+
+
+def resolve_input_device(name_part: str | None) -> int | None:
+    """
+    Ищет микрофон по части имени (без учёта регистра). Возвращает индекс устройства
+    или None — тогда sounddevice берёт микрофон Windows по умолчанию.
+    """
+    if not name_part:
+        return None
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0 and name_part.lower() in dev['name'].lower():
+            return idx
+    print(f"[STT] Микрофон '{name_part}' не найден, использую микрофон Windows по умолчанию.")
+    return None
 
 
 class STTManager:
@@ -38,6 +53,10 @@ class STTManager:
         self.model = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
         self.input_queue = input_queue
         self.agent_busy = agent_busy_event
+
+        self.device = resolve_input_device(STT_INPUT_DEVICE)
+        device_name = sd.query_devices(self.device, kind='input')['name']
+        print(f"[STT] Микрофон: {device_name}")
 
         self.samplerate = STT_SAMPLERATE
         self.block_duration = STT_BLOCK_DURATION
@@ -69,8 +88,19 @@ class STTManager:
         block_size = int(self.samplerate * self.block_duration)
 
         while self._running:
+            try:
+                self._listen_once(block_size)
+            except Exception as e:
+                # Без этого любая ошибка микрофона молча убивала поток, и голосовой ввод пропадал до перезапуска
+                print(f"[STT] Ошибка микрофона: {type(e).__name__}: {e}. Повтор через 2 с...")
+                time.sleep(2)
+
+    def _listen_once(self, block_size: int):
+        """Слушает до конца одной фразы (или до остановки), затем возвращается, чтобы поток переоткрылся."""
+        if self._running:
             # Открываем поток ввода с нужными параметрами
             with sd.InputStream(
+                device=self.device,
                 samplerate=self.samplerate,
                 channels=1,
                 blocksize=block_size,
@@ -130,7 +160,3 @@ class STTManager:
                             is_recording = False
                             # Выходим из внутреннего цикла, чтобы переоткрыть поток (предотвращает зависания)
                             break
-
-                # Если цикл прерван по _running == False, выходим из внешнего while
-                if not self._running:
-                    break

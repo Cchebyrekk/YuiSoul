@@ -237,6 +237,37 @@ if VISION_ENABLED:
     TOOLS[-2:-2] = VISION_TOOLS  # перед stay_silent/task_complete
 
 
+# === Внутренний ход (автономия/рефлексия): Юи думает про себя, текст не озвучивается ===
+SPEAK_ALOUD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "speak_aloud",
+        "description": (
+            "Сказать что-то вслух пользователю во время размышлений про себя. Всё остальное, "
+            "что ты пишешь сейчас, — мысли, их никто не слышит. Используй, только если правда "
+            "хочешь что-то сказать или спросить: одна-две короткие фразы."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "Что сказать вслух"}},
+            "required": ["text"]
+        }
+    }
+}
+
+# Управление ПК вмешивается в то, чем пользователь сейчас занят (печать в его активное окно,
+# горячие клавиши), а wait просто занимает основной поток — во внутреннем ходе их нет по умолчанию.
+PC_CONTROL_TOOL_NAMES = {"open_app", "type", "hotkey", "kill_app"}
+INNER_EXCLUDED_TOOL_NAMES = {"wait", "stay_silent"}
+
+
+def inner_tools(allow_pc_control: bool = False) -> list:
+    """Инструменты внутреннего хода: обычные минус исключённые, плюс speak_aloud."""
+    excluded = INNER_EXCLUDED_TOOL_NAMES | (set() if allow_pc_control else PC_CONTROL_TOOL_NAMES)
+    tools = [t for t in TOOLS if t["function"]["name"] not in excluded]
+    return tools[:-1] + [SPEAK_ALOUD_TOOL] + tools[-1:]  # task_complete остаётся последним
+
+
 def save_memory_handler(mm: MemoryManager, path: str, content: str, confidence: float = 0.0) -> str:
     """
     Обёртка для вызова mm.save_fact.
