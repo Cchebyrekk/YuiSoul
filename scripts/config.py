@@ -17,10 +17,10 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 TTS_DIR = os.path.join(BASE_DIR, "tts")
 MEMORY_DIR = os.path.join(BASE_DIR, "memory")
-TURBOQUANT_DIR = os.path.join(BASE_DIR, "turboquant")
+TURBOQUANT_DIR = os.path.join(BASE_DIR, "llama_things", "turboquant-new", "build", "bin")
 
 # LLM модель (путь к .gguf)
-LLM_MODEL_PATH = os.path.join(MODELS_DIR, "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf")
+LLM_MODEL_PATH = os.path.join(MODELS_DIR, "Qwen3.6-35B-A3B-Uncensored-Genesis-MTP-APEX-Compact.gguf")
 LLM_HOST = "127.0.0.1"
 LLM_PORT = 8080
 LLM_API_URL = f"http://{LLM_HOST}:{LLM_PORT}/v1/chat/completions"
@@ -34,25 +34,20 @@ SESSION_FILE = os.path.join(SESSIONS_DIR, "latest.json")
 
 # ==================== ПАРАМЕТРЫ LLM ====================
 
-# Параметры для быстрых ответов (приветствия, простые факты)
-FAST_TEMPERATURE = 0.1
-FAST_MAX_TOKENS = 256
+# max_tokens включает и рассуждения модели (reasoning), а не только ответ:
+# при 256 Qwen3.6 успевала только подумать и обрывалась без ответа (finish=length).
 
-# Параметры для сложных размышлений
-DEEP_TEMPERATURE = 0.6
-DEEP_MAX_TOKENS = 8192
-
-DEFAULT_TOP_K = 40
-DEFAULT_TOP_P = 0.95
-DEFAULT_REPEAT_PENALTY = 1.1
-
-# Параметры для быстрых ответов (приветствия, простые факты)
-FAST_TEMPERATURE = 0.1
-FAST_MAX_TOKENS = 256
+# Параметры для быстрых ответов (приветствия, простые реплики)
+FAST_TEMPERATURE = 0.5             # 0.1 делала реплики плоскими и одинаковыми — личности нужна вариативность
+FAST_MAX_TOKENS = 1024
 
 # Параметры для сложных размышлений
 DEEP_TEMPERATURE = 0.6
 DEEP_MAX_TOKENS = 2048
+
+DEFAULT_TOP_K = 40
+DEFAULT_TOP_P = 0.95
+DEFAULT_REPEAT_PENALTY = 1.1
 
 # Токены остановки (для прекращения генерации)
 STOP_TOKENS = ["<|im_end|>"]
@@ -81,6 +76,32 @@ AUTONOMY_IDLE_THRESHOLD = 300      # секунд бездействия для 
 # промолчать. Это подсказка, а не принуждение: агент решает сам.
 # 0.0 полностью отключает — агент будет отвечать на каждое сообщение, как раньше.
 SILENCE_NUDGE_CHANCE = 0.15
+
+# Своя воля (scripts/agent/will.py): перед ответом Юи отдельным коротким вызовом
+# (без рассуждений, ~0.5-2 с) решает, хочет ли она выполнять просьбу: ДА / НЕТ / ЧАСТИЧНО.
+# Нужна потому, что uncensored-модель почти не отказывает сама по ходу ответа.
+WILL_CHECK_ENABLED = True
+WILL_CHECK_MAX_TOKENS = 80
+WILL_CHECK_TEMPERATURE = 0.7
+
+# ==================== ЗРЕНИЕ ====================
+
+# Инструменты look_at_screen / view_image / zoom_image. Требуют llama-server с --mmproj (vision-проектор
+# Qwen3.6); без него сервер отклонит запрос с картинкой — тогда выключи.
+VISION_ENABLED = True
+SCREENSHOT_MAX_SIDE = 1280         # длинная сторона скриншота после уменьшения (~1000 токенов)
+SCREENSHOT_JPEG_QUALITY = 85
+ZOOM_MAX_UPSCALE = 3.0             # во сколько раз максимум увеличивать мелкий кроп (мелкий текст)
+VISION_MAX_IMAGES_PER_TURN = 3     # сколько последних картинок держать в контексте внутри хода (серия zoom)
+
+# ==================== ИНТЕРНЕТ ====================
+
+# Инструменты search_web (DuckDuckGo через пакет ddgs, без API-ключа) и read_webpage.
+WEB_ENABLED = True
+WEB_SEARCH_REGION = "ru-ru"        # регион выдачи DuckDuckGo (wt-wt — без привязки к стране)
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_PAGE_MAX_CHARS = 6000          # сколько текста страницы отдавать модели (~2000 токенов)
+WEB_TIMEOUT = 15                   # секунд на поиск/загрузку страницы
 
 # ==================== RAG 2.0 / РЕФЛЕКСИЯ ====================
 

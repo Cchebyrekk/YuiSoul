@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Large binaries: models, llama.cpp builds, TTS runtime
+models/
+llama_things/
+tts/
+*.zip
+*.gguf
+
+# Runtime data
+sessions/
+debug_logs/
+memory/

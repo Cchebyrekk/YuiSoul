@@ -29,7 +29,8 @@ from scripts.config import (
     LLM_TIMEOUT,
     ENABLE_AUTONOMY,
     ENABLE_REFLECTION,
-    SILENCE_NUDGE_CHANCE
+    SILENCE_NUDGE_CHANCE,
+    WILL_CHECK_ENABLED
 )
 from scripts.utils.http import SESSION
 from scripts.agent.session import save_session, load_session, clear_session
@@ -37,6 +38,7 @@ from scripts.agent.prompt import build_system_prompt
 from scripts.agent.context import compress_context, extract_and_save_facts, inject_dynamic_context
 from scripts.agent.parser import StreamParser
 from scripts.agent.executor import ActionExecutor
+from scripts.agent.will import check_willingness, will_note
 from scripts.agent.autonomy import AutonomyManager
 from scripts.agent.emotion import EmotionBridge
 from scripts.memory.manager import MemoryManager
@@ -45,6 +47,7 @@ from scripts.memory.reflection import ReflectionManager
 from scripts.speech.stt import STTManager
 from scripts.speech.tts import TTSManager
 from scripts.tools.registry import TOOLS, build_registry
+from scripts.tools.vision import strip_images
 
 
 # Глобальные флаги и очереди (будут созданы в __main__)
@@ -65,22 +68,37 @@ SILENCE_NUDGE_MESSAGE = {
 
 
 
+# Ключевые слова ищутся только с начала слова (\b), а не как подстроки:
+# раньше "да" находилось в "далее", "нет" — в "интернет", "пока" — в "покажи".
+# Слова-задачи — это основы: \bнапиш совпадёт с "напиши", "напишешь", "написать" нет.
+DEEP_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
+    'почему', 'как сделать', 'объясни', 'проанализируй', 'разбер',
+    'создай', 'найди', 'поищи', 'загугли', 'открой', 'запусти', 'установи', 'закрой',
+    'настрой', 'проверь', 'сравни', 'рассчитай', 'посчитай', 'переведи',
+    'составь', 'опиши', 'разработай', 'напиш', 'отредактируй', 'исправь', 'почини',
+    'переименуй', 'удали', 'скачай', 'сделай', 'посмотри', 'глянь', 'прочитай', 'придумай',
+]) + r')', re.IGNORECASE)
+
+# Короткие реплики: целые слова/фразы (\b с обеих сторон).
+FAST_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
+    'привет', 'здравствуй', 'пока', 'спасибо', 'как дела', 'ок', 'ok', 'да', 'нет', 'угу', 'ага',
+]) + r')\b', re.IGNORECASE)
+
+FAST_MAX_WORDS = 6  # длиннее — уже не "просто реплика", даже если в ней есть "да" или "спасибо"
+
+
 def classify_request(user_input: str) -> str:
     """Возвращает 'fast' или 'deep' в зависимости от запроса."""
-    fast_keywords = ['привет', 'здравствуй', 'пока', 'спасибо', 'как дела', 'ok', 'да', 'нет']
-    deep_keywords =     deep_keywords = [
-        'почему', 'как сделать', 'напиши код', 'объясни', 'проанализируй',
-        'создай', 'найди', 'открой', 'запусти', 'установи',
-        'настрой', 'проверь', 'сравни', 'рассчитай', 'переведи',
-        'составь', 'опиши', 'разработай', 'напиши', 'отредактируй'
-    ]
-    input_lower = user_input.lower()
-    if any(kw in input_lower for kw in deep_keywords):
+    # Служебные пометки (например, про голосовой интеррапт) — не слова пользователя
+    text = re.sub(r'<system_note>.*?</system_note>', ' ', user_input, flags=re.DOTALL).strip()
+    n_words = len(text.split())
+
+    if DEEP_KEYWORDS_RE.search(text):
         return 'deep'
-    if any(kw in input_lower for kw in fast_keywords):
+    if n_words <= FAST_MAX_WORDS and FAST_KEYWORDS_RE.search(text):
         return 'fast'
     # По умолчанию — fast, если запрос короткий (< 5 слов)
-    if len(user_input.split()) < 5:
+    if n_words < 5:
         return 'fast'
     return 'deep'  # для всего остального
 
@@ -140,10 +158,23 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 {"role": "user", "content": user_input_final}
             ]
     else:
+        # Скриншоты прошлых ходов уже описаны в ответах агента — выкидываем сами картинки
+        strip_images(messages)
         messages[0]["content"] = system_prompt
         messages.append({"role": "user", "content": user_input_final})
 
-    # 4. Основной цикл итераций
+    # 4. Своя воля: хочет ли она вообще за это браться (один раз на сообщение
+    # пользователя, до всех итераций). Решение уходит в каждый запрос этого хода
+    # эфемерной подсказкой, в историю не сохраняется.
+    will_message = None
+    if WILL_CHECK_ENABLED:
+        agent_is_working.set()
+        decision, reason = check_willingness(messages)
+        agent_is_working.clear()
+        print(f"[WILL] Решение: {decision}{' — ' + reason if reason else ''}")
+        will_message = will_note(decision, reason)
+
+    # 5. Основной цикл итераций
     try:
         for step in range(1, max_steps + 1):
             print(f"\n--- ИТЕРАЦИЯ {step} ---")
@@ -196,7 +227,8 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
                 # Подсказка про stay_silent добавляется ТОЛЬКО в этот запрос,
                 # в постоянную историю (messages) она не попадает.
-                request_messages = messages + [SILENCE_NUDGE_MESSAGE] if silence_nudge else messages
+                ephemeral = ([will_message] if will_message else []) + ([SILENCE_NUDGE_MESSAGE] if silence_nudge else [])
+                request_messages = messages + ephemeral
 
                 # В payload:
                 payload = {

@@ -16,6 +16,10 @@ rank-bm25>=0.2.2
 keyboard>=0.13.5
 pyperclip>=1.8.2
 pygetwindow>=0.0.9
+Pillow>=10.0.0              # скриншоты для look_at_screen
+ddgs>=9.0.0                 # поиск в интернете (search_web)
+trafilatura>=2.0.0          # текст страниц (read_webpage)
+emoji>=2.10.0               # озвучка эмодзи словами в TTS
 
 # Optional (WebSocket для эмоций, если понадобится)
 websocket-client>=1.6.0
