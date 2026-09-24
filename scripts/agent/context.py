@@ -18,14 +18,16 @@ from scripts.config import (
 from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.prompt import get_dynamic_state
 from scripts.utils.http import SESSION
+from scripts.tools.vision import content_text, message_chars
 
 
 def estimate_chars(messages: List[Dict[str, str]]) -> int:
     """
     Приблизительная оценка размера контекста в символах.
-    Для простоты используем длину строкового представления.
+    Для простоты используем длину строкового представления
+    (картинки считаются фиксированной оценкой, а не длиной base64).
     """
-    return len(str(messages))
+    return sum(message_chars(m) for m in messages)
 
 
 def compress_context(messages: List[Dict[str, str]], memory_manager: Optional[MemoryManager] = None) -> List[Dict[str, str]]:
@@ -50,7 +52,7 @@ def compress_context(messages: List[Dict[str, str]], memory_manager: Optional[Me
     tail_msgs = []
     tail_chars = 0
     for msg in reversed(rest_msgs):
-        msg_chars = len(str(msg))
+        msg_chars = message_chars(msg)
         if tail_chars + msg_chars > tail_limit:
             break
         tail_msgs.insert(0, msg)
@@ -89,7 +91,7 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         # Очищаем сообщения от служебных тегов
         cleaned_history = []
         for msg in history_snapshot:
-            content = msg.get("content", "")
+            content = content_text(msg.get("content", ""))
             # Удаляем системные события
             clean_content = re.sub(r'<system_event>.*?</system_event>', '', content, flags=re.DOTALL)
             clean_content = clean_content.strip()

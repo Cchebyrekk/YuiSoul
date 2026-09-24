@@ -2,11 +2,13 @@
 """
 Управление сессиями (сохранение/загрузка истории диалога).
 """
+import copy
 import json
 import os
 from datetime import datetime
 
 from scripts.config import SESSION_FILE
+from scripts.tools.vision import strip_images
 
 def save_session(messages: list):
     """Сохраняет историю сообщений в файл сессии."""
@@ -16,7 +18,8 @@ def save_session(messages: list):
         pass
     data = {
         "saved_at": datetime.now().isoformat(),
-        "messages": messages
+        # base64-картинки в файл сессии не пишем
+        "messages": strip_images(copy.deepcopy(messages))
     }
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
