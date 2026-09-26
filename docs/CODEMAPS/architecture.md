@@ -46,7 +46,7 @@ scripts/
   tools/           tool schemas + handlers (OS control, vision, web)
   memory/          fact store, vector+BM25 search, soul, reflection
   speech/          stt.py (faster-whisper), tts.py (Silero)
-  utils/           http.py (shared requests.Session), latency.py
+  utils/           http.py (shared requests.Session), lang.py (ru/en by script)
   ui/, game/       empty stubs
   tests/tts_t.py   manual TTS smoke script
 ```

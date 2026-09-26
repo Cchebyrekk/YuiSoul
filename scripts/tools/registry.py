@@ -127,7 +127,8 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "task_complete",
-            "description": "Завершение цикла агента. Вызывать ОБЯЗАТЕЛЬНО, когда задача выполнена.",
+            "description": ("Закончить текущую задачу или размышление наедине. Это инструмент: вызывай его, "
+                            "а не пиши о завершении словами — слова ничего не завершают."),
             "parameters": {
                 "type": "object",
                 "properties": {"reason": {"type": "string", "description": "Причина завершения"}},
@@ -147,12 +148,15 @@ VISION_TOOLS = [
                 "Посмотреть на экран пользователя (скриншот). Используй, когда пользователь просит "
                 "посмотреть, что у него на экране, спрашивает про открытое окно/ошибку/картинку, "
                 "или когда тебе нужно проверить результат своего действия (open_app, type и т.п.). "
-                "Картинка придёт следующим сообщением. Мелкое не разобрать — приблизь через zoom_image."
+                "У пользователя может быть несколько мониторов: без параметров снимаются все сразу "
+                "(слева направо), в ответе будет их список. Чтобы рассмотреть один монитор в полном "
+                "качестве — укажи его номер. Картинка придёт следующим сообщением. "
+                "Мелкое не разобрать — приблизь через zoom_image."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "all_screens": {"type": "boolean", "description": "true — снять все мониторы разом. По умолчанию только основной."}
+                    "monitor": {"type": "integer", "description": "Номер монитора слева направо (1, 2, 3...). 0 или не указывать — все мониторы разом."}
                 },
                 "required": []
             }
@@ -276,6 +280,14 @@ def save_memory_handler(mm: MemoryManager, path: str, content: str, confidence: 
     return mm.save_fact(path, content, confidence=confidence)
 
 
+def _monitor_arg(kwargs: dict) -> int:
+    """Номер монитора из аргументов модели; нечисловое значение или старое all_screens — все мониторы."""
+    try:
+        return max(0, int(kwargs.get("monitor", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_registry(mm: MemoryManager) -> dict:
     """
     Собирает реестр функций для вызова из агента.
@@ -296,7 +308,7 @@ def build_registry(mm: MemoryManager) -> dict:
                                                   news=bool(kwargs.get("news", False)),
                                                   timelimit=kwargs.get("timelimit", "") or ""),
         "read_webpage": lambda **kwargs: read_webpage(kwargs.get("url", "")),
-        "look_at_screen": lambda **kwargs: vision.look_at_screen(bool(kwargs.get("all_screens", False))),
+        "look_at_screen": lambda **kwargs: vision.look_at_screen(_monitor_arg(kwargs)),
         "view_image": lambda **kwargs: vision.view_image(kwargs.get("path", "")),
         "zoom_image": lambda **kwargs: vision.zoom(kwargs.get("x1", 0), kwargs.get("y1", 0),
                                                    kwargs.get("x2", 1000), kwargs.get("y2", 1000),

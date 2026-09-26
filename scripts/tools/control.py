@@ -3,14 +3,10 @@
 Управление компьютером: запуск приложений, ввод текста, хоткеи, убийство процессов, ожидание.
 Возвращает структурированные ответы с полем status.
 """
-import os
 import time
 import subprocess
 import pyperclip
 import keyboard
-import pygetwindow as gw
-
-from scripts.config import BASE_DIR
 
 class ComputerControl:
     def __init__(self):

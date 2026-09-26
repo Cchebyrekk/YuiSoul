@@ -11,7 +11,6 @@ import scripts.speech.stt as stt_mod
 import scripts.tools.control as control_mod
 from scripts.speech.stt import STTManager, resolve_input_device
 from scripts.tools.control import ComputerControl
-from scripts.utils.latency import log_latency, measure_time
 
 DEVICES = [
     {"name": "Микрофон гарнитуры (Wireless Controller)", "max_input_channels": 1},
@@ -175,17 +174,3 @@ def test_wait_is_capped(monkeypatch):
     assert control.wait(999)["message"] == "Ожидание 300 секунд завершено." and slept == [300]
     assert control.wait("abc")["status"] == "fatal"
 
-
-def test_latency_decorators(capsys):
-    logs = []
-
-    @log_latency(logs.append)
-    def add(a, b):
-        return a + b
-
-    @measure_time
-    def mul(a, b):
-        return a * b
-
-    assert add(2, 3) == 5 and logs[0].startswith("[LATENCY] add:")
-    assert mul(2, 3) == 6 and "[LATENCY] mul:" in capsys.readouterr().out

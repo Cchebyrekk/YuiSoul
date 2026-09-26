@@ -45,6 +45,20 @@ def test_xml_tool_call_fallback_without_duplicates():
     assert calls[0]["id"] == "xml_0" and calls[0]["function"]["name"] == "save_memory"
 
 
+def test_tool_call_written_as_text_becomes_real_call():
+    # Замерено на модели: "search_web{...}" и "<task_complete> <reason>...</reason>" текстом
+    tools = {"search_web", "task_complete", "save_memory"}
+    reply, _, calls, _ = feed(StreamParser(tools), {"content": 'Давай посмотрим.\nsearch_web{"query": "Нолан"}'})
+    assert reply == "Давай посмотрим."
+    assert calls[0]["function"] == {"name": "search_web", "arguments": '{"query": "Нолан"}'}
+
+    reply, _, calls, _ = feed(StreamParser(tools), {"content": "<task_complete> <reason>Мысль исчерпана.</reason>"})
+    assert reply == "" and json.loads(calls[0]["function"]["arguments"]) == {"reason": "Мысль исчерпана."}
+
+    reply, _, calls, _ = feed(StreamParser(tools), {"content": 'Формат ответа: config{"a": 1}'})
+    assert calls == [] and "config" in reply            # незнакомое имя — обычный текст
+
+
 def test_emotion_self_report_extracted_and_clamped():
     reply, _, _, emotion = feed(StreamParser(), {"content": "<emotion>любопытство, 1.7</emotion> Ого"})
     assert reply == "Ого" and emotion == ("любопытство", 1.0)

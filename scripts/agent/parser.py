@@ -20,7 +20,12 @@ class StreamParser:
     - Разделение по </thought> (всё до тега — мысли, после — ответ)
     """
 
-    def __init__(self):
+    def __init__(self, known_tools: Optional[set] = None):
+        """
+        :param known_tools: имена доступных инструментов — чтобы распознать вызов, который модель
+            написала текстом ("search_web{...}", "<task_complete>...") вместо function calling.
+        """
+        self.known_tools = set(known_tools or ())
         self.content_buffer = ""
         self.reasoning_buffer = ""
         self.tool_calls: List[Dict[str, Any]] = []
@@ -126,6 +131,11 @@ class StreamParser:
             except json.JSONDecodeError:
                 pass
 
+        # 3б. Вызов инструмента, написанный текстом (замерено: "search_web{"query": ...}" и
+        # "<task_complete> <reason>...</reason>" вместо function calling). Превращаем в настоящий вызов.
+        if self.known_tools and not self.tool_calls:
+            final_reply = self._extract_text_tool_calls(final_reply)
+
         # 4. Удаляем огрызки <output> (если модель их использовала)
         final_reply = re.sub(r'</?output>', '', final_reply).strip()
 
@@ -164,6 +174,36 @@ class StreamParser:
             final_reply = re.sub(r'<emotion>.*?</emotion>', '', final_reply, flags=re.DOTALL).strip()
 
         return final_reply, reasoning, self.tool_calls, self_reported_emotion
+
+    def _extract_text_tool_calls(self, text: str) -> str:
+        """Находит вызовы вида name{json} и <name>...</name> для известных инструментов, вырезает их из текста."""
+        def add(name, args):
+            self.tool_calls.append({"id": f"text_{len(self.tool_calls)}", "type": "function",
+                                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+
+        def json_call(match):
+            name = match.group(1)
+            if name not in self.known_tools:
+                return match.group(0)
+            try:
+                args = json.loads(match.group(2))
+            except json.JSONDecodeError:
+                return match.group(0)
+            add(name, args if isinstance(args, dict) else {})
+            return ""
+
+        text = re.sub(r'\b([a-z_]+)\s*(\{[^{}]*\})', json_call, text)
+
+        def tag_call(match):
+            name = match.group(1)
+            if name not in self.known_tools:
+                return match.group(0)
+            reason = re.sub(r'<[^>]+>', ' ', match.group(2) or "").strip()
+            add(name, {"reason": reason} if name in ("task_complete", "stay_silent") else {})
+            return ""
+
+        text = re.sub(r'<([a-z_]+)>(.*?)(?:</\1>|$)', tag_call, text, flags=re.DOTALL)
+        return text.strip()
 
     def reset(self):
         """Сбрасывает состояние парсера для нового запроса."""

@@ -39,7 +39,7 @@ from scripts.config import (
     REFLECTION_MAX_STEPS
 )
 from scripts.utils.http import SESSION
-from scripts.agent.session import save_session, load_session, clear_session
+from scripts.agent.session import save_session, load_session
 from scripts.agent.prompt import build_system_prompt
 from scripts.agent.context import compress_context, extract_and_save_facts, inject_dynamic_context
 from scripts.agent.parser import StreamParser
@@ -77,8 +77,9 @@ SILENCE_NUDGE_MESSAGE = {
 
 ENGLISH_REPLY_NOTE = {
     "role": "user",
-    "content": ("<system_note>The User is speaking English right now. Reply in natural spoken English, "
-                "keeping your personality. Do not switch to Russian unless the User does.</system_note>"),
+    "content": ("<system_note>LANGUAGE: the User's last message is in English. Your reply MUST be in English — "
+                "every sentence, even though earlier conversation and your notes are in Russian. Keep your "
+                "personality. Switch back to Russian only when the User writes in Russian.</system_note>"),
 }
 
 
@@ -86,9 +87,9 @@ ENGLISH_REPLY_NOTE = {
 INNER_CONTINUE_NOTE = {
     "role": "user",
     "content": (
-        "<system_note>Это была твоя мысль про себя. Если хочется — продолжай: развивай её, "
-        "поищи что-то, запомни вывод, скажи что-то вслух через speak_aloud. Если мысль исчерпана — "
-        "вызови task_complete.</system_note>"
+        "<system_note>Это была твоя мысль про себя — пользователь её не слышал. Если хочется — продолжай: "
+        "развивай её, поищи что-то, запомни вывод, скажи ему что-то через инструмент speak_aloud. "
+        "Если мысль исчерпана — вызови инструмент task_complete.</system_note>"
     ),
 }
 
@@ -109,6 +110,8 @@ DEEP_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
     'настрой', 'проверь', 'сравни', 'рассчитай', 'посчитай', 'переведи',
     'составь', 'опиши', 'разработай', 'напиш', 'отредактируй', 'исправь', 'почини',
     'переименуй', 'удали', 'скачай', 'сделай', 'посмотри', 'глянь', 'прочитай', 'придумай',
+    # просьбы запомнить — задача с инструментом: без рассуждений модель отвечала "Запомнила!", не вызывая save_memory
+    'запомни', 'запиши', 'не забудь', 'remember', 'note that', 'save this',
     # English: те же задачи, если разговор идёт по-английски
     # (без make/read/run/close — "that makes sense", "ready", "close to" включали бы рассуждения зря)
     'why', 'how do', 'how to', 'explain', 'analy', 'find', 'search', 'look up', 'google', 'open', 'launch',
@@ -123,6 +126,17 @@ FAST_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
 ]) + r')\b', re.IGNORECASE)
 
 FAST_MAX_WORDS = 6  # длиннее — уже не "просто реплика", даже если в ней есть "да" или "спасибо"
+
+
+# Явная просьба о действии, которое делается только инструментом. На них модель в рассуждениях писала
+# "нужно вызвать save_memory / open_app", а вслух отвечала "Запомнила" / "Открываю" — без вызова (замерено).
+# Первый шаг такого хода обязан быть вызовом инструмента (tool_choice=required).
+ACTION_REQUEST_RE = re.compile(r'\b(' + '|'.join([
+    'запомни', 'запиши', 'не забудь', 'remember', 'note that', 'save this',
+    'открой', 'запусти', 'закрой', 'нажми', 'напечатай', 'введи',
+    'open', 'launch', 'close the', 'press', 'type in',
+    'найди', 'поищи', 'загугли', 'search', 'look up', 'google',
+]) + r')', re.IGNORECASE)
 
 
 def is_task(user_input: str) -> bool:
@@ -237,6 +251,8 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
     language_note = ENGLISH_REPLY_NOTE if not inner and text_language(spoken_text) == "en" else None
 
     request_tools = inner_tools(AUTONOMY_ALLOW_PC_CONTROL) if inner else TOOLS
+    executor.web_content_seen = False  # защита от команд со страниц — на каждый ход заново (см. executor)
+    must_act = not inner and bool(ACTION_REQUEST_RE.search(spoken_text))
     continue_note = None  # внутренний ход: подсказка "продолжай думать или task_complete" (эфемерная)
 
     # 5. Основной цикл итераций
@@ -282,7 +298,10 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Решаем один раз за шаг, а не на каждую попытку: иначе ретраи
             # после сетевой ошибки будут "перебрасывать монетку" заново.
-            silence_nudge = not inner and random.random() < SILENCE_NUDGE_CHANCE
+            # Только на первом шаге обычного разговора: посреди задачи (после результатов поиска) модель
+            # принимала подсказку за новое сообщение пользователя и молчала вместо ответа (замерено).
+            silence_nudge = (not inner and step == 1 and not is_task(user_task)
+                             and random.random() < SILENCE_NUDGE_CHANCE)
             if silence_nudge:
                 print("[SYSTEM] (тихая подсказка: можно промолчать, если не хочется отвечать)")
 
@@ -299,10 +318,11 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
                 # Подсказка про stay_silent добавляется ТОЛЬКО в этот запрос,
                 # в постоянную историю (messages) она не попадает.
+                # Языковая подсказка — последней: русская подсказка после неё перетягивала ответ на русский
                 ephemeral = (([will_message] if will_message else [])
-                             + ([language_note] if language_note else [])
                              + ([SILENCE_NUDGE_MESSAGE] if silence_nudge else [])
-                             + ([continue_note] if continue_note else []))
+                             + ([continue_note] if continue_note else [])
+                             + ([language_note] if language_note else []))
                 request_messages = messages + ephemeral
 
                 # В payload:
@@ -318,6 +338,8 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                     "stream": True,
                     "chat_template_kwargs": {"enable_thinking": thinking}
                 }
+                if must_act and step == 1:
+                    payload["tool_choice"] = "required"  # см. ACTION_REQUEST_RE
 
                 try:
                     response = SESSION.post(LLM_API_URL, json=payload, stream=True, timeout=LLM_TIMEOUT)
@@ -328,7 +350,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                         continue
 
                     # Парсим стрим через StreamParser
-                    parser = StreamParser()
+                    parser = StreamParser(known_tools={t["function"]["name"] for t in request_tools})
                     executor.start_streaming_tts()
                     print("[LLM STREAM]: ", end="", flush=True)
                     for line in response.iter_lines():
@@ -420,6 +442,12 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 # дальше. Вторая подряд без действий — размышление исчерпано (модель часто
                 # пишет "можно завершать" текстом вместо task_complete).
                 thought = re.sub(r'</?inner_thought>', '', raw_reply).strip()
+                if not thought:
+                    # Пустой ответ после действий (например, после speak_aloud) — размышление окончено
+                    messages.pop()
+                    extract_and_save_facts(messages, memory_manager)
+                    save_session(messages)
+                    return messages
                 messages[-1]["content"] = f"<inner_thought>{thought}</inner_thought>"
                 if continue_note is not None:
                     extract_and_save_facts(messages, memory_manager)

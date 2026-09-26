@@ -9,15 +9,18 @@
 поэтому приближение реально добавляет деталей.
 """
 import base64
+import ctypes
 import io
 import os
 import threading
+from ctypes import wintypes
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageGrab
 
 from scripts.config import (
     SCREENSHOT_MAX_SIDE,
+    SCREENSHOT_MAX_SIDE_ALL,
     SCREENSHOT_JPEG_QUALITY,
     ZOOM_MAX_UPSCALE,
     VISION_MAX_IMAGES_PER_TURN,
@@ -53,9 +56,27 @@ class VisionState:
 
     # --- открытие изображения ---
 
-    def look_at_screen(self, all_screens: bool = False) -> Dict[str, Any]:
-        img = ImageGrab.grab(all_screens=all_screens)
-        return self._set_source(img, "экран")
+    def look_at_screen(self, monitor: int = 0) -> Dict[str, Any] | str:
+        """
+        monitor=0 — все мониторы одним кадром (как расположены, слева направо);
+        1..N — один монитор в полном качестве. Номера — слева направо.
+        """
+        full = ImageGrab.grab(all_screens=True)
+        monitors = list_monitors(full.size)
+        legend = describe_monitors(monitors)
+        if not monitor or len(monitors) <= 1:
+            # Общий кадр из нескольких мониторов длинный (3 x 1920 = 5760 px): при обычном пределе
+            # 1280 px каждый монитор сжался бы до ~430 px — ничего не прочитать.
+            max_side = SCREENSHOT_MAX_SIDE_ALL if len(monitors) > 1 else SCREENSHOT_MAX_SIDE
+            result = self._set_source(full, "все мониторы" if len(monitors) > 1 else "экран", max_side=max_side)
+        elif 1 <= monitor <= len(monitors):
+            m = monitors[monitor - 1]
+            result = self._set_source(full.crop(m["box"]), f"монитор {monitor}")
+        else:
+            return f"Ошибка: монитора {monitor} нет. {legend}"
+        if len(monitors) > 1:
+            result["message"] = f"{result['message']} {legend}"
+        return result
 
     def view_image(self, path: str) -> Dict[str, Any] | str:
         path = os.path.expandvars(os.path.expanduser((path or "").strip().strip('"')))
@@ -71,13 +92,13 @@ class VisionState:
             return f"Ошибка: не удалось открыть картинку: {e}"
         return self._set_source(loaded, os.path.basename(path))
 
-    def _set_source(self, img: Image.Image, label: str) -> Dict[str, Any]:
+    def _set_source(self, img: Image.Image, label: str, max_side: int = 0) -> Dict[str, Any]:
         with self._lock:
             self.source = img.convert("RGB")
             self.label = label
             self.view = (0, 0, *self.source.size)
             w, h = self.source.size
-            data_url, sent = self._render(self.view)
+            data_url, sent = self._render(self.view, max_side=max_side)
         return {
             "image_url": data_url,
             "message": (f"Открыто: {label} ({w}x{h}, передано в {sent[0]}x{sent[1]}). "
@@ -131,16 +152,67 @@ class VisionState:
                 box[lo], box[hi] = start, min(limit, start + MIN_CROP_SIDE)
         return box
 
-    def _render(self, box: Box) -> Tuple[str, Tuple[int, int]]:
-        """Кроп из оригинала -> вписать в SCREENSHOT_MAX_SIDE (мелкое — увеличить до ZOOM_MAX_UPSCALE) -> JPEG data URL."""
+    def _render(self, box: Box, max_side: int = 0) -> Tuple[str, Tuple[int, int]]:
+        """Кроп из оригинала -> вписать в max_side (по умолчанию SCREENSHOT_MAX_SIDE; мелкое — увеличить до ZOOM_MAX_UPSCALE) -> JPEG data URL."""
         crop = self.source.crop(box)
         cw, ch = crop.size
-        scale = min(SCREENSHOT_MAX_SIDE / max(cw, ch), ZOOM_MAX_UPSCALE)
+        scale = min((max_side or SCREENSHOT_MAX_SIDE) / max(cw, ch), ZOOM_MAX_UPSCALE)
         if scale != 1:
             crop = crop.resize((max(1, round(cw * scale)), max(1, round(ch * scale))), Image.LANCZOS)
         buf = io.BytesIO()
         crop.save(buf, format="JPEG", quality=SCREENSHOT_JPEG_QUALITY)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii"), crop.size
+
+
+def _monitor_rects() -> List[Tuple[int, int, int, int, bool]]:
+    """(left, top, right, bottom, основной) каждого монитора в координатах рабочего стола Windows."""
+    rects = []
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    def callback(hmon, hdc, rect, data):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info))
+        r = info.rcMonitor
+        rects.append((r.left, r.top, r.right, r.bottom, bool(info.dwFlags & 1)))
+        return 1
+
+    proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(callback), 0)
+    return rects
+
+
+def list_monitors(image_size: Tuple[int, int]) -> List[Dict[str, Any]]:
+    """
+    Мониторы слева направо с прямоугольником ("box") в пикселях общего скриншота
+    ImageGrab.grab(all_screens=True). Если масштаб Windows (DPI) делает скриншот другого
+    размера, чем рабочий стол, координаты масштабируются.
+    """
+    try:
+        rects = _monitor_rects()
+    except Exception:
+        rects = []
+    if not rects:
+        return [{"box": (0, 0, *image_size), "primary": True}]
+    left, top = min(r[0] for r in rects), min(r[1] for r in rects)
+    width, height = max(r[2] for r in rects) - left, max(r[3] for r in rects) - top
+    sx, sy = image_size[0] / width, image_size[1] / height
+    monitors = [{"box": (round((l - left) * sx), round((t - top) * sy), round((r - left) * sx), round((b - top) * sy)),
+                 "primary": primary} for l, t, r, b, primary in rects]
+    return sorted(monitors, key=lambda m: (m["box"][0], m["box"][1]))
+
+
+def describe_monitors(monitors: List[Dict[str, Any]]) -> str:
+    """"Мониторы слева направо: 1 (основной) 1920x1080, 2 1920x1080. ..." — для ответа инструмента."""
+    parts = []
+    for i, m in enumerate(monitors, 1):
+        l, t, r, b = m["box"]
+        parts.append(f"{i}{' (основной)' if m['primary'] else ''} {r - l}x{b - t}")
+    return ("Мониторы слева направо: " + ", ".join(parts) +
+            ". Один монитор в полном качестве — look_at_screen с monitor=N.")
 
 
 # Глобальный экземпляр (как control в registry.py)

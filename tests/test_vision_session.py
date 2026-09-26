@@ -60,6 +60,55 @@ def test_view_image_and_zoom(tmp_path):
     assert vs.view == (0, 0, 400, 200) and "[0, 0, 1000, 1000]" in full["message"]
 
 
+@pytest.fixture
+def three_monitors(monkeypatch):
+    """Три монитора 1920x1080 в ряд: красный (основной), зелёный, синий."""
+    shot = Image.new("RGB", (5760, 1080))
+    for i, color in enumerate(["red", "green", "blue"]):
+        shot.paste(color, (i * 1920, 0, (i + 1) * 1920, 1080))
+    monkeypatch.setattr(vision_mod.ImageGrab, "grab", lambda all_screens=False: shot)
+    monkeypatch.setattr(vision_mod, "_monitor_rects",
+                        lambda: [(1920, 0, 3840, 1080, False), (0, 0, 1920, 1080, True), (3840, 0, 5760, 1080, False)])
+    return shot
+
+
+def test_look_at_all_monitors_by_default(three_monitors):
+    vs = VisionState()
+    result = vs.look_at_screen()
+    assert vs.source.size == (5760, 1080)
+    assert "передано в 2560x480" in result["message"]            # не ужато до 1280 — по ~850 px на монитор
+    assert "Мониторы слева направо: 1 (основной) 1920x1080, 2 1920x1080, 3 1920x1080" in result["message"]
+
+
+def test_look_at_one_monitor(three_monitors):
+    vs = VisionState()
+    result = vs.look_at_screen(monitor=3)
+    assert vs.source.size == (1920, 1080) and vs.source.getpixel((960, 540)) == (0, 0, 255)
+    assert result["message"].startswith("Открыто: монитор 3")
+    assert "монитора 4 нет" in vs.look_at_screen(monitor=4)
+
+
+def test_monitor_boxes_follow_dpi_scaling(monkeypatch):
+    # При масштабе 150% скриншот больше, чем рабочий стол в логических пикселях
+    monkeypatch.setattr(vision_mod, "_monitor_rects", lambda: [(0, 0, 1280, 720, True), (1280, 0, 2560, 720, False)])
+    assert [m["box"] for m in vision_mod.list_monitors((3840, 1080))] == [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]
+
+
+def test_single_monitor_has_no_legend(monkeypatch):
+    monkeypatch.setattr(vision_mod.ImageGrab, "grab", lambda all_screens=False: Image.new("RGB", (1920, 1080)))
+    monkeypatch.setattr(vision_mod, "_monitor_rects", lambda: [(0, 0, 1920, 1080, True)])
+    result = VisionState().look_at_screen(monitor=2)             # номер игнорируется — монитор один
+    assert "Мониторы" not in result["message"] and "1280x720" in result["message"]
+
+
+def test_registry_monitor_argument():
+    from scripts.tools.registry import _monitor_arg
+    assert _monitor_arg({"monitor": 2}) == 2
+    assert _monitor_arg({"monitor": "3"}) == 3
+    assert _monitor_arg({"all_screens": True}) == 0             # старый параметр -> все мониторы
+    assert _monitor_arg({"monitor": "левый"}) == 0
+
+
 def test_broken_image_file(tmp_path):
     bad = tmp_path / "bad.png"
     bad.write_bytes(b"not an image")

@@ -15,6 +15,7 @@ scripts/speech/silero_model_en.pt
 
 # Test artifacts
 .coverage
+.reports/
 htmlcov/
 
 # Runtime data

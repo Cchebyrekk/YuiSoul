@@ -4,11 +4,10 @@
 Извлекает эмоции из текста (rule-based), отправляет их по WebSocket
 или в лог для будущей интеграции с аватаром.
 """
-import re
 import json
 import threading
 from enum import Enum
-from typing import Tuple, Optional
+from typing import Tuple
 from scripts.config import EMOTION_WEBSOCKET_URL, EMOTION_EXTRACTION_ENABLED
 
 

@@ -107,6 +107,23 @@ def test_inner_turn_ends_after_two_plain_thoughts(env):
     assert tts.said == []
 
 
+def test_inner_turn_ends_on_empty_reply_after_action(env):
+    run, llm, tts = env
+    llm.responses += [FakeResponse(lines=sse(tool_call("speak_aloud", {"text": "Эй, ты тут?"}))),
+                      FakeResponse(lines=sse({"reasoning_content": "всё"}))]           # пустой ответ
+    messages = run("подумай", inner="autonomy")
+    assert len(llm.requests) == 2 and tts.said == ["Эй, ты тут?"]
+    assert "<inner_thought></inner_thought>" not in [m.get("content") for m in messages]
+
+
+def test_text_tool_call_in_inner_turn_is_executed(env):
+    run, llm, _ = env
+    llm.responses.append(FakeResponse(lines=sse({"content": "<task_complete> <reason>Готово.</reason>"})))
+    messages = run("подумай", inner="reflection")
+    assert len(llm.requests) == 1                                  # task_complete сработал, без лишних шагов
+    assert any(m.get("tool_calls") for m in messages)
+
+
 def test_inner_turn_yields_to_user(env):
     run, llm, _ = env
     q = queue.Queue()
@@ -145,6 +162,54 @@ def test_reasoning_only_for_tasks_and_inner_turns(env, monkeypatch):
     llm.responses.append(FakeResponse(lines=sse(tool_call("task_complete", {"reason": "всё"}))))
     run("подумай", inner="autonomy")                                         # размышление наедине
     assert llm.requests[-1]["chat_template_kwargs"] == {"enable_thinking": True} and will_calls == [1]
+
+
+def test_remember_request_forces_tool_call_on_first_step(env, memory_dir):
+    """Регрессия: модель отвечала "Запомнила", не вызывая save_memory."""
+    run, llm, _ = env
+    llm.responses += [FakeResponse(lines=sse(tool_call("save_memory", {"path": "user/family", "content": "Сестру зовут Лена"}))),
+                      FakeResponse(lines=sse({"content": "Запомнила."}))]
+    run("Запомни: мою сестру зовут Лена")
+    assert llm.requests[0]["tool_choice"] == "required"
+    assert "tool_choice" not in llm.requests[1]                  # дальше модель отвечает свободно
+    assert "Лена" in (memory_dir / "user" / "family.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("text, forced", [
+    ("Открой блокнот, пожалуйста", True),
+    ("найди погоду на завтра", True),
+    ("please open steam", True),
+    ("почему небо синее?", False),                              # задача, но инструмент не обязателен
+    ("как дела?", False),
+])
+def test_action_requests_force_a_tool_call(env, text, forced):
+    run, llm, _ = env
+    llm.responses.append(FakeResponse(lines=sse({"content": "Ок."})))
+    run(text, max_steps=1)
+    assert ("tool_choice" in llm.requests[0]) is forced
+
+
+def test_silence_nudge_only_on_first_step_of_plain_chat(env, monkeypatch):
+    run, llm, _ = env
+    monkeypatch.setattr(loop, "SILENCE_NUDGE_CHANCE", 1.0)
+    nudge = loop.SILENCE_NUDGE_MESSAGE["content"]
+    llm.responses += [FakeResponse(lines=sse(tool_call("search_memory", {"query": "кот"}))),
+                      FakeResponse(lines=sse({"content": "Ок."}))]
+    run("расскажи что-нибудь про моего кота, если помнишь его")
+    contents = [[m["content"] for m in r["messages"]] for r in llm.requests]
+    assert nudge in contents[0] and nudge not in contents[1]     # посреди хода подсказки нет
+
+    llm.responses.append(FakeResponse(lines=sse({"content": "Ищу."})))
+    run("найди погоду")
+    assert nudge not in [m["content"] for m in llm.requests[-1]["messages"]]   # задачи — без неё
+
+
+def test_language_note_is_the_last_message(env, monkeypatch):
+    run, llm, _ = env
+    monkeypatch.setattr(loop, "SILENCE_NUDGE_CHANCE", 1.0)
+    llm.responses.append(FakeResponse(lines=sse({"content": "Hey."})))
+    run("Hey Yui, how's it going?")
+    assert llm.requests[0]["messages"][-1]["content"] == loop.ENGLISH_REPLY_NOTE["content"]
 
 
 def test_llm_error_then_step_limit(env):
