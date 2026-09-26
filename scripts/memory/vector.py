@@ -7,6 +7,7 @@ import os
 import json
 import math
 import datetime
+import threading
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -27,6 +28,11 @@ class VectorSearchEngine:
         self.vectors_file = os.path.join(self.index_dir, "vectors.npy")
         self.meta_file = os.path.join(self.index_dir, "metadata.json")
         self.threshold = VECTOR_SEARCH_THRESHOLD
+        # Индекс пишут фоновые потоки (extract_and_save_facts, рефлексия), а читает поиск
+        # в начале каждого хода. Без блокировки удаление/добавление сдвигает индексы
+        # metadata посреди перебора в search() -> IndexError или текст чужого документа.
+        # Кодирование моделью (долгое) идёт вне блокировки.
+        self._lock = threading.RLock()
 
         # Загружаем или создаём индекс
         if os.path.exists(self.vectors_file) and os.path.exists(self.meta_file):
@@ -50,14 +56,15 @@ class VectorSearchEngine:
         осиротевшая запись, указывающая на текст, которого больше нет на диске).
         Безопасно вызывать для несуществующего doc_id — это no-op.
         """
-        if len(self.vectors) == 0:
-            return
-        existing_idx = next((i for i, m in enumerate(self.metadata) if m["id"] == doc_id), None)
-        if existing_idx is None:
-            return
-        self.vectors = np.delete(self.vectors, existing_idx, axis=0)
-        del self.metadata[existing_idx]
-        self._save_index()
+        with self._lock:
+            if len(self.vectors) == 0:
+                return
+            existing_idx = next((i for i, m in enumerate(self.metadata) if m["id"] == doc_id), None)
+            if existing_idx is None:
+                return
+            self.vectors = np.delete(self.vectors, existing_idx, axis=0)
+            del self.metadata[existing_idx]
+            self._save_index()
 
     def add_document(self, doc_id: str, text: str):
         """
@@ -71,22 +78,23 @@ class VectorSearchEngine:
         vector = self.model.encode(f"passage: {text}", normalize_embeddings=True)
         now_iso = datetime.datetime.now().isoformat()
 
-        if len(self.vectors) == 0:
-            self.vectors = np.array([vector])
-            self.metadata = [{"id": doc_id, "text": text, "updated_at": now_iso}]
-        else:
-            # Проверяем, существует ли уже такой doc_id
-            existing_idx = next((i for i, m in enumerate(self.metadata) if m["id"] == doc_id), None)
-            if existing_idx is not None:
-                # Обновление
-                self.vectors[existing_idx] = vector
-                self.metadata[existing_idx]["text"] = text
-                self.metadata[existing_idx]["updated_at"] = now_iso
+        with self._lock:
+            if len(self.vectors) == 0:
+                self.vectors = np.array([vector])
+                self.metadata = [{"id": doc_id, "text": text, "updated_at": now_iso}]
             else:
-                # Добавление
-                self.vectors = np.vstack([self.vectors, vector])
-                self.metadata.append({"id": doc_id, "text": text, "updated_at": now_iso})
-        self._save_index()
+                # Проверяем, существует ли уже такой doc_id
+                existing_idx = next((i for i, m in enumerate(self.metadata) if m["id"] == doc_id), None)
+                if existing_idx is not None:
+                    # Обновление
+                    self.vectors[existing_idx] = vector
+                    self.metadata[existing_idx]["text"] = text
+                    self.metadata[existing_idx]["updated_at"] = now_iso
+                else:
+                    # Добавление
+                    self.vectors = np.vstack([self.vectors, vector])
+                    self.metadata.append({"id": doc_id, "text": text, "updated_at": now_iso})
+            self._save_index()
 
     def _recency_factor(self, updated_at: str) -> float:
         """
@@ -118,34 +126,39 @@ class VectorSearchEngine:
         обновлённые/подтверждённые факты имели приоритет над устаревшими
         при равной релевантности.
         """
-        if len(self.vectors) == 0:
-            return []
+        with self._lock:
+            if len(self.vectors) == 0:
+                return []
 
         # Для E5: запросы маркируются префиксом "query: "
         query_vector = self.model.encode(f"query: {query}", normalize_embeddings=True)
 
-        # Косинусное сходство (векторы нормализованы)
-        cosine_scores = np.dot(self.vectors, query_vector)
+        with self._lock:
+            if len(self.vectors) == 0:  # индекс могли очистить, пока кодировали запрос
+                return []
 
-        # Сначала фильтруем по релевантности (чистый косинус), потом ранжируем
-        candidates = []
-        for idx, score in enumerate(cosine_scores):
-            if score > self.threshold:
-                meta = self.metadata[idx]
-                recency = self._recency_factor(meta.get("updated_at"))
-                ranking_score = float(score) + RECENCY_BOOST_WEIGHT * recency
-                candidates.append((idx, float(score), ranking_score))
+            # Косинусное сходство (векторы нормализованы)
+            cosine_scores = np.dot(self.vectors, query_vector)
 
-        candidates.sort(key=lambda c: c[2], reverse=True)
+            # Сначала фильтруем по релевантности (чистый косинус), потом ранжируем
+            candidates = []
+            for idx, score in enumerate(cosine_scores):
+                if score > self.threshold:
+                    meta = self.metadata[idx]
+                    recency = self._recency_factor(meta.get("updated_at"))
+                    ranking_score = float(score) + RECENCY_BOOST_WEIGHT * recency
+                    candidates.append((idx, float(score), ranking_score))
 
-        results = []
-        for idx, cosine_score, _ranking_score in candidates[:top_k]:
-            results.append({
-                "id": self.metadata[idx]["id"],
-                "text": self.metadata[idx]["text"],
-                "score": cosine_score
-            })
-        return results
+            candidates.sort(key=lambda c: c[2], reverse=True)
+
+            results = []
+            for idx, cosine_score, _ranking_score in candidates[:top_k]:
+                results.append({
+                    "id": self.metadata[idx]["id"],
+                    "text": self.metadata[idx]["text"],
+                    "score": cosine_score
+                })
+            return results
 
     def rebuild_index(self):
         """Перестраивает индекс из всех .md файлов в MEMORY_DIR."""
@@ -171,16 +184,18 @@ class VectorSearchEngine:
                     continue
 
         if not all_docs:
-            self.vectors = np.array([])
-            self.metadata = []
-            self._save_index()
+            with self._lock:
+                self.vectors = np.array([])
+                self.metadata = []
+                self._save_index()
             return
 
         # Строим векторы для всех документов
         texts = [f"passage: {doc[1]}" for doc in all_docs]
         vectors = self.model.encode(texts, normalize_embeddings=True)
 
-        self.vectors = np.array(vectors)
-        self.metadata = [{"id": doc[0], "text": doc[1], "updated_at": doc[2]} for doc in all_docs]
-        self._save_index()
+        with self._lock:
+            self.vectors = np.array(vectors)
+            self.metadata = [{"id": doc[0], "text": doc[1], "updated_at": doc[2]} for doc in all_docs]
+            self._save_index()
         print(f"[VECTOR] Индекс перестроен: {len(self.metadata)} документов.")

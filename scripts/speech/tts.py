@@ -15,16 +15,18 @@ import pygame
 import requests
 import numpy as np
 
-from scripts.config import TTS_BUFFER, TTS_CHANNELS, SILERO_SAMPLE_RATE
+from scripts.config import TTS_BUFFER, TTS_CHANNELS, SILERO_SAMPLE_RATE, TTS_SPEAKER_RU, TTS_SPEAKER_EN
+from scripts.utils.lang import text_language
 
 
 class TTSManager:
-    def __init__(self, tts_active_event: threading.Event = None, speaker: str = "xenia"):
+    def __init__(self, tts_active_event: threading.Event = None, speaker: str = TTS_SPEAKER_RU):
         """
         :param tts_active_event: событие, устанавливаемое во время воспроизведения.
-        :param speaker: имя диктора (xenia, baya, kseniya, eugene, random)
+        :param speaker: имя русского диктора (xenia, baya, kseniya, eugene, random)
         """
         self.speaker = speaker
+        self.speakers = {"ru": speaker, "en": TTS_SPEAKER_EN}
         self.device = torch.device('cpu')
         self.tts_active = tts_active_event if tts_active_event else threading.Event()
         self.audio_queue = queue.Queue()
@@ -34,6 +36,22 @@ class TTSManager:
         print("[TTS] Загрузка Silero...")
         self.model, self.sample_rate = self._load_silero_model()
         print(f"[TTS] Silero загружен, частота {self.sample_rate} Гц, диктор {self.speaker}.")
+        # Английский голос — отдельная модель: русская на целиком английском тексте падает с ошибкой
+        self.models = {"ru": self.model}
+        en_model = self._load_en_model()
+        if en_model is not None:
+            self.models["en"] = en_model
+            print(f"[TTS] Английский голос: {self.speakers['en']}.")
+        # Прогрев: первые вызовы apply_tts на CPU идут 1.2-1.8 с вместо ~0.17 с —
+        # пусть это случится при запуске, а не на первой реплике Юи.
+        for lang, warm_text in (("ru", "Привет."), ("en", "Hello.")):
+            if lang not in self.models:
+                continue
+            try:
+                for _ in range(2):
+                    self.models[lang].apply_tts(warm_text, speaker=self.speakers[lang], sample_rate=self.sample_rate)
+            except Exception as e:
+                print(f"[TTS] Прогрев ({lang}) не удался: {e}")
 
         # Инициализация pygame mixer с частотой модели
         try:
@@ -67,18 +85,37 @@ class TTSManager:
         # с реальной частотой синтеза. Используем единую константу из конфига.
         return model, SILERO_SAMPLE_RATE
 
+    def _load_en_model(self):
+        """Английская модель Silero v3_en, если скачана (scripts/speech/silero_model_en.pt)."""
+        path = os.path.join(os.path.dirname(__file__), "silero_model_en.pt")
+        if not os.path.exists(path):
+            print("[TTS] Английской модели нет (scripts/speech/silero_model_en.pt) — английские фразы не озвучиваются.")
+            return None
+        try:
+            model = torch.package.PackageImporter(path).load_pickle("tts_models", "model")
+            model.to(self.device)
+            return model
+        except Exception as e:
+            print(f"[TTS] Не удалось загрузить английскую модель: {e}")
+            return None
+
     def speak(self, text: str):
         if not self._running or not text:
             return
         cleaned = re.sub(r'<[^>]+>', '', text).strip()
         cleaned = re.sub(r'[\*\_\#\`\[\]\(\)]', '', cleaned).strip()
-        if cleaned:
-            self.audio_queue.put(cleaned)
+        if not cleaned:
+            return
+        lang = text_language(cleaned)
+        if lang not in self.models:
+            print(f"[TTS] Нет голоса для языка '{lang}', фраза не озвучена: {cleaned[:60]}")
+            return
+        self.audio_queue.put((cleaned, lang))
 
     def _worker(self):
         while self._running:
             try:
-                text = self.audio_queue.get(timeout=1.0)
+                text, lang = self.audio_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
@@ -87,7 +124,7 @@ class TTSManager:
                 # частота, на которой Silero реально сгенерирует аудио, а не
                 # то, что "предполагает" плеер. Она обязана совпадать с той,
                 # на которой инициализирован pygame.mixer (см. __init__).
-                audio = self.model.apply_tts(text, speaker=self.speaker, sample_rate=self.sample_rate)
+                audio = self.models[lang].apply_tts(text, speaker=self.speakers[lang], sample_rate=self.sample_rate)
                 # Приводим к numpy (float32)
                 if hasattr(audio, 'cpu'):
                     audio = audio.cpu()

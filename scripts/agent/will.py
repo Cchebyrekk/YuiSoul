@@ -23,6 +23,7 @@ from scripts.config import (
     WILL_CHECK_TEMPERATURE,
 )
 from scripts.utils.http import SESSION
+from scripts.tools.registry import TOOLS
 
 WILL_QUESTION = (
     "<system_note>Прежде чем отвечать, реши для себя: хочешь ли ты выполнять то, о чём "
@@ -47,6 +48,9 @@ def check_willingness(messages: List[Dict]) -> Tuple[str, str]:
         "max_tokens": WILL_CHECK_MAX_TOKENS,
         "temperature": WILL_CHECK_TEMPERATURE,  # не 0: настроение должно немного плавать
         "chat_template_kwargs": {"enable_thinking": False},
+        # Инструменты входят в отрисованный промпт: без них начало промпта не совпадает
+        # с основным запросом, и общий KV-кэш истории не переиспользуется.
+        "tools": TOOLS,
     }
     try:
         resp = SESSION.post(LLM_API_URL, json=payload, timeout=60)

@@ -3,6 +3,8 @@
 Управление контекстом агента: сжатие истории, извлечение фактов из сообщений,
 инъекция динамического состояния (время, железо).
 """
+import copy
+import json
 import re
 import time
 import threading
@@ -13,12 +15,15 @@ from scripts.config import (
     CONTEXT_TAIL_RATIO,
     LLM_TIMEOUT,
     MEMORY_DIR,
-    LLM_API_URL
+    LLM_API_URL,
+    FACT_EXTRACTION_IDLE_DELAY
 )
 from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.prompt import get_dynamic_state
 from scripts.utils.http import SESSION
 from scripts.tools.vision import content_text, message_chars
+from scripts.tools.registry import TOOLS
+from scripts.agent.autonomy import seconds_since_activity
 
 
 def estimate_chars(messages: List[Dict[str, str]]) -> int:
@@ -84,10 +89,20 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
     if not history:
         return
 
+    # Если передана вся история (с системным промптом) — запрос строится ПОВЕРХ неё, с теми же
+    # инструментами, что у основного цикла: общий префикс переиспользует KV-кэш llama-server.
+    # Отдельный промпт при --parallel 1 мог выбить кэш, и следующий ответ пользователю
+    # заново прогонял тысячи токенов истории (замерено: до 16 с).
+    prefix = []
+    if history[0].get("role") == "system":
+        prefix, history = copy.deepcopy(history), history[1:]
+        if not history:
+            return
+
     # Делаем снимок последних сообщений (не больше 6)
     history_snapshot = history[-6:] if len(history) > 6 else history.copy()
 
-    def _worker():
+    def _worker(cancellable: bool = False):
         # Очищаем сообщения от служебных тегов
         cleaned_history = []
         for msg in history_snapshot:
@@ -108,21 +123,39 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         extraction_prompt = memory_manager.get_fact_extraction_prompt(cleaned_history, tree)
 
         try:
-            response = SESSION.post(
-                LLM_API_URL,
-                json={
-                    "messages": [{"role": "user", "content": extraction_prompt}],
-                    "max_tokens": 2048,
-                    "temperature": 0.2,
-                },
-                timeout=180.0
-            )
-            if response.status_code != 200:
-                print(f"[SYSTEM ERROR] Извлечение фактов: сервер вернул {response.status_code}")
-                return
+            payload = {
+                "messages": prefix + [{"role": "user", "content": extraction_prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                # Без рассуждений: с ними извлечение держало единственный слот llama-server 35-46 с,
+                # и реплика пользователя в это время ждала в очереди. Без них — ~0.5-2 с.
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            if prefix:
+                payload["tools"] = TOOLS  # инструменты входят в отрисованный промпт — без них префикс не совпадёт
+            # Потоком — чтобы фоновое извлечение можно было оборвать: закрытие соединения
+            # останавливает генерацию в llama-server и сразу освобождает его единственный слот.
+            payload["stream"] = True
+            request_start = time.monotonic()
+            raw_facts = ""
+            with SESSION.post(LLM_API_URL, json=payload, stream=True, timeout=180.0) as response:
+                if response.status_code != 200:
+                    print(f"[SYSTEM ERROR] Извлечение фактов: сервер вернул {response.status_code}")
+                    return
+                for line in response.iter_lines():
+                    # "<=": часы Windows идут шагами ~15 мс — активность в тот же такт тоже считается
+                    if cancellable and seconds_since_activity() <= time.monotonic() - request_start:
+                        print("[SYSTEM] Извлечение фактов прервано: пользователь заговорил.")
+                        return
+                    if not line or not line.startswith(b"data: ") or line[6:].strip() == b"[DONE]":
+                        continue
+                    try:
+                        delta = json.loads(line[6:])["choices"][0].get("delta", {})
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                    raw_facts += delta.get("content") or ""
 
-            raw_facts = response.json()["choices"][0]["message"]["content"].strip()
-            raw_facts = re.sub(r'<[^>]+>', '', raw_facts).strip()
+            raw_facts = re.sub(r'<[^>]+>', '', raw_facts.strip()).strip()
 
             if not raw_facts or raw_facts.upper() == "NULL":
                 return
@@ -156,9 +189,18 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
     # Запуск в фоновом потоке или синхронно
     if wait:
         _worker()
-    else:
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
+        return
+
+    def _deferred():
+        # Не с горячего пути: извлечение занимает единственный слот llama-server на ~14 с, и быстрая
+        # реплика пользователя ждала бы его в очереди. Ждём паузы в разговоре; если за это время
+        # пользователь заговорил — пропускаем (следующий ход снова возьмёт последние сообщения).
+        time.sleep(FACT_EXTRACTION_IDLE_DELAY)
+        if seconds_since_activity() < FACT_EXTRACTION_IDLE_DELAY:
+            return
+        _worker(cancellable=True)
+
+    threading.Thread(target=_deferred, daemon=True).start()
 
 
 def inject_dynamic_context(user_input: str, memory_context: str = "", soul_patch: str = "") -> str:

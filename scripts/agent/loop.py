@@ -6,6 +6,7 @@
 выполняет итерации агента, управляет сессией.
 """
 import concurrent.futures
+import copy
 import queue
 import random
 import threading
@@ -32,6 +33,7 @@ from scripts.config import (
     ENABLE_REFLECTION,
     SILENCE_NUDGE_CHANCE,
     WILL_CHECK_ENABLED,
+    THINK_ON_TASKS_ONLY,
     AUTONOMY_MAX_STEPS,
     AUTONOMY_ALLOW_PC_CONTROL,
     REFLECTION_MAX_STEPS
@@ -52,6 +54,7 @@ from scripts.speech.stt import STTManager
 from scripts.speech.tts import TTSManager
 from scripts.tools.registry import TOOLS, build_registry, inner_tools
 from scripts.tools.vision import strip_images
+from scripts.utils.lang import text_language
 
 
 # Глобальные флаги и очереди (будут созданы в __main__)
@@ -72,6 +75,13 @@ SILENCE_NUDGE_MESSAGE = {
 
 
 
+ENGLISH_REPLY_NOTE = {
+    "role": "user",
+    "content": ("<system_note>The User is speaking English right now. Reply in natural spoken English, "
+                "keeping your personality. Do not switch to Russian unless the User does.</system_note>"),
+}
+
+
 # Внутренний ход: после мысли без инструментов — эфемерная подсказка продолжить или закончить.
 INNER_CONTINUE_NOTE = {
     "role": "user",
@@ -83,6 +93,13 @@ INNER_CONTINUE_NOTE = {
 }
 
 
+def _user_input_pending(input_queue: queue.Queue) -> bool:
+    """Есть ли в очереди реплика пользователя (не забирая её). Под мьютексом очереди:
+    клавиатура, STT и фоновые менеджеры кладут в неё из своих потоков."""
+    with input_queue.mutex:
+        return any(item[0] in ("text", "voice") for item in input_queue.queue)
+
+
 # Ключевые слова ищутся только с начала слова (\b), а не как подстроки:
 # раньше "да" находилось в "далее", "нет" — в "интернет", "пока" — в "покажи".
 # Слова-задачи — это основы: \bнапиш совпадёт с "напиши", "напишешь", "написать" нет.
@@ -92,14 +109,26 @@ DEEP_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
     'настрой', 'проверь', 'сравни', 'рассчитай', 'посчитай', 'переведи',
     'составь', 'опиши', 'разработай', 'напиш', 'отредактируй', 'исправь', 'почини',
     'переименуй', 'удали', 'скачай', 'сделай', 'посмотри', 'глянь', 'прочитай', 'придумай',
+    # English: те же задачи, если разговор идёт по-английски
+    # (без make/read/run/close — "that makes sense", "ready", "close to" включали бы рассуждения зря)
+    'why', 'how do', 'how to', 'explain', 'analy', 'find', 'search', 'look up', 'google', 'open', 'launch',
+    'install', 'set up', 'check', 'compare', 'calculate', 'translate', 'write', 'edit',
+    'fix', 'rename', 'delete', 'download', 'create', 'look at', 'come up with',
 ]) + r')', re.IGNORECASE)
 
 # Короткие реплики: целые слова/фразы (\b с обеих сторон).
 FAST_KEYWORDS_RE = re.compile(r'\b(' + '|'.join([
     'привет', 'здравствуй', 'пока', 'спасибо', 'как дела', 'ок', 'ok', 'да', 'нет', 'угу', 'ага',
+    'hi', 'hey', 'hello', 'bye', 'thanks', 'thank you', 'how are you', 'okay', 'yes', 'yeah', 'no', 'nope',
 ]) + r')\b', re.IGNORECASE)
 
 FAST_MAX_WORDS = 6  # длиннее — уже не "просто реплика", даже если в ней есть "да" или "спасибо"
+
+
+def is_task(user_input: str) -> bool:
+    """Просьба что-то сделать (найди/напиши/открой...), а не просто разговор."""
+    text = re.sub(r'<system_note>.*?</system_note>', ' ', user_input, flags=re.DOTALL)
+    return bool(DEEP_KEYWORDS_RE.search(text))
 
 
 def classify_request(user_input: str) -> str:
@@ -187,13 +216,25 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
     # 4. Своя воля: хочет ли она вообще за это браться (один раз на сообщение
     # пользователя, до всех итераций). Решение уходит в каждый запрос этого хода
     # эфемерной подсказкой, в историю не сохраняется.
+    # Рассуждения — самая дорогая часть задержки голосового ответа (см. THINK_ON_TASKS_ONLY в config.py):
+    # в обычном разговоре отвечаем сразу, думаем — над задачами и в размышлениях наедине.
+    thinking = bool(inner) or not THINK_ON_TASKS_ONLY or is_task(user_task)
+
     will_message = None
-    if WILL_CHECK_ENABLED and not inner:  # внутренний ход — её собственная инициатива, спрашивать нечего
+    # Проверка воли — только для задач: на просто разговор она по правилу всегда "ДА", а стоит ~2.4 с.
+    # Внутренний ход — её собственная инициатива, спрашивать нечего.
+    if WILL_CHECK_ENABLED and not inner and thinking:
         agent_is_working.set()
         decision, reason = check_willingness(messages)
         agent_is_working.clear()
         print(f"[WILL] Решение: {decision}{' — ' + reason if reason else ''}")
         will_message = will_note(decision, reason)
+
+    # Реплика по-английски: правила в системном промпте мало — история, личность и служебный
+    # контекст на русском, и модель отвечала по-русски (проверено). Эфемерная подсказка в хвосте
+    # запроса: в историю не пишется и KV-кэш не ломает.
+    spoken_text = re.sub(r'<system_note>.*?</system_note>', ' ', user_task, flags=re.DOTALL)  # без русских служебных пометок
+    language_note = ENGLISH_REPLY_NOTE if not inner and text_language(spoken_text) == "en" else None
 
     request_tools = inner_tools(AUTONOMY_ALLOW_PC_CONTROL) if inner else TOOLS
     continue_note = None  # внутренний ход: подсказка "продолжай думать или task_complete" (эфемерная)
@@ -208,8 +249,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Внутренний ход уступает пользователю: заговорил — заканчиваем размышления,
             # его реплика останется в очереди и будет обработана обычным ходом.
-            if inner and input_queue is not None and any(
-                    item[0] in ("text", "voice") for item in list(input_queue.queue)):
+            if inner and input_queue is not None and _user_input_pending(input_queue):
                 print(f"\n[INNER] Пользователь заговорил — Юи прерывает размышления ({inner}).")
                 save_session(messages)
                 return messages
@@ -260,6 +300,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 # Подсказка про stay_silent добавляется ТОЛЬКО в этот запрос,
                 # в постоянную историю (messages) она не попадает.
                 ephemeral = (([will_message] if will_message else [])
+                             + ([language_note] if language_note else [])
                              + ([SILENCE_NUDGE_MESSAGE] if silence_nudge else [])
                              + ([continue_note] if continue_note else []))
                 request_messages = messages + ephemeral
@@ -274,7 +315,8 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                     "top_p": DEFAULT_TOP_P,
                     "repeat_penalty": DEFAULT_REPEAT_PENALTY,
                     "stop": STOP_TOKENS,
-                    "stream": True
+                    "stream": True,
+                    "chat_template_kwargs": {"enable_thinking": thinking}
                 }
 
                 try:
@@ -353,7 +395,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                     # Сохраняем факты и сессию. При stay_silent пользователь просто
                     # не получит ответа в этом ходу — это осознанный выбор агента,
                     # а не сбой.
-                    extract_and_save_facts(messages[1:], memory_manager)
+                    extract_and_save_facts(messages, memory_manager)
                     save_session(messages)
                     return messages
                 # Иначе продолжаем цикл (следующая итерация)
@@ -368,7 +410,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
             )
             if should_exit:
                 # Пустой ответ — выходим
-                extract_and_save_facts(messages[1:], memory_manager)
+                extract_and_save_facts(messages, memory_manager)
                 save_session(messages)
                 return messages
 
@@ -380,7 +422,7 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
                 thought = re.sub(r'</?inner_thought>', '', raw_reply).strip()
                 messages[-1]["content"] = f"<inner_thought>{thought}</inner_thought>"
                 if continue_note is not None:
-                    extract_and_save_facts(messages[1:], memory_manager)
+                    extract_and_save_facts(messages, memory_manager)
                     save_session(messages)
                     return messages
                 continue_note = INNER_CONTINUE_NOTE
@@ -388,32 +430,51 @@ def run_agent_loop(user_task: str, messages: list = None, max_steps: int = MAX_S
 
             # Если есть финальный ответ без инструментов — сохраняем и завершаем цикл
             if raw_reply and not tool_calls:
-                extract_and_save_facts(messages[1:], memory_manager)
+                extract_and_save_facts(messages, memory_manager)
                 save_session(messages)
                 return messages
 
         # Если цикл завершился по максимуму шагов
         print(f"[SYSTEM] Достигнут лимит шагов{f' ({inner})' if inner else ''}, завершаю.")
-        extract_and_save_facts(messages[1:], memory_manager)
+        extract_and_save_facts(messages, memory_manager)
         save_session(messages)
         return messages
 
     except KeyboardInterrupt:
         print("\n[SYSTEM] Ручная остановка (Ctrl+C). Спасаю факты...")
         if len(messages) > 1:
-            extract_and_save_facts(messages[1:], memory_manager, wait=True)
+            extract_and_save_facts(messages, memory_manager, wait=True)
         save_session(messages)
         return messages
     except Exception as e:
         print(f"\n[SYSTEM] Фатальная ошибка: {e}. Спасаю факты...")
         if len(messages) > 1:
-            extract_and_save_facts(messages[1:], memory_manager, wait=True)
+            extract_and_save_facts(messages, memory_manager, wait=True)
         save_session(messages)
         return messages
 
 
 # ==================== ТОЧКА ВХОДА (если запускаем напрямую) ====================
 if __name__ == "__main__":
+    # Прошлую сессию грузим самой первой, до моделей: размышлениям Юи история нужна уже до того,
+    # как пользователь что-то скажет, а прогрев кэша должен успеть, пока грузятся Whisper/Silero/e5.
+    messages = load_session()
+    if messages:
+        print("[SYSTEM] Обнаружена предыдущая сессия. Восстановление...")
+        messages[0]["content"] = build_system_prompt()  # в файле мог остаться старый промпт
+
+        # Прогрев KV-кэша: история сессии — тысячи токенов, и первая реплика после запуска
+        # прогоняла её заново (замерено: 16-19 с до первого звука). Пусть сервер обработает её
+        # в фоне сейчас, пока грузятся модели и пользователь ещё молчит.
+        def _warm_kv_cache(history):
+            try:
+                SESSION.post(LLM_API_URL, json={"messages": history, "tools": TOOLS, "max_tokens": 1,
+                                                "chat_template_kwargs": {"enable_thinking": False}}, timeout=300)
+                print("[SYSTEM] Кэш истории прогрет.")
+            except Exception as e:
+                print(f"[SYSTEM] Прогрев кэша истории не удался: {e}")
+        threading.Thread(target=_warm_kv_cache, args=(copy.deepcopy(messages),), daemon=True).start()
+
     # Инициализация компонентов
     memory_mgr = MemoryManager()
     soul_mgr = SoulManager()
@@ -421,6 +482,9 @@ if __name__ == "__main__":
     emotion_br = EmotionBridge()
     registry = build_registry(memory_mgr)
     executor = ActionExecutor(memory_mgr, tts_mgr, registry)
+
+    # Прогрев эмбеддингов: первый encode на CPU ~0.5 с — пусть не на первой реплике
+    memory_mgr.vector_engine.model.encode("query: прогрев", normalize_embeddings=True)
 
     # Очередь ввода (текст/голос)
     input_queue = queue.Queue()
@@ -465,12 +529,6 @@ if __name__ == "__main__":
     kb_thread = threading.Thread(target=keyboard_thread, args=(input_queue,), daemon=True)
     kb_thread.start()
 
-    # Прошлую сессию грузим сразу, а не на первой реплике: размышлениям Юи нужна
-    # история уже до того, как пользователь что-то скажет.
-    messages = load_session()
-    if messages:
-        print("[SYSTEM] Обнаружена предыдущая сессия. Восстановление...")
-        messages[0]["content"] = build_system_prompt()  # в файле мог остаться старый промпт
     inner_managers = {"autonomy": autonomy, "reflection": reflection}
     inner_max_steps = {"autonomy": AUTONOMY_MAX_STEPS, "reflection": REFLECTION_MAX_STEPS}
     try:
