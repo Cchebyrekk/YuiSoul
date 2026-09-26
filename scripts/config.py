@@ -5,7 +5,6 @@
 """
 
 import os
-import torch
 
 # ==================== ПУТИ ====================
 
@@ -15,7 +14,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Папки данных
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
-TTS_DIR = os.path.join(BASE_DIR, "tts")
 MEMORY_DIR = os.path.join(BASE_DIR, "memory")
 TURBOQUANT_DIR = os.path.join(BASE_DIR, "llama_things", "turboquant-new", "build", "bin")
 
@@ -63,7 +61,6 @@ CONTEXT_TAIL_RATIO = 0.25          # доля хвоста при сжатии
 
 # Таймауты (секунды)
 LLM_TIMEOUT = 120.0
-HTTP_READ_TIMEOUT = 120.0
 
 # Флаги
 ENABLE_AUTONOMY = True            # автономные мысли в фоне
@@ -109,7 +106,8 @@ WILL_CHECK_TEMPERATURE = 0.7
 # Инструменты look_at_screen / view_image / zoom_image. Требуют llama-server с --mmproj (vision-проектор
 # Qwen3.6); без него сервер отклонит запрос с картинкой — тогда выключи.
 VISION_ENABLED = True
-SCREENSHOT_MAX_SIDE = 1280         # длинная сторона скриншота после уменьшения (~1000 токенов)
+SCREENSHOT_MAX_SIDE = 1280         # длинная сторона скриншота после уменьшения
+SCREENSHOT_MAX_SIDE_ALL = 2560     # то же для общего кадра всех мониторов (3 x 1920 в ряд -> ~850 px на монитор) (~1000 токенов)
 SCREENSHOT_JPEG_QUALITY = 85
 ZOOM_MAX_UPSCALE = 3.0             # во сколько раз максимум увеличивать мелкий кроп (мелкий текст)
 VISION_MAX_IMAGES_PER_TURN = 3     # сколько последних картинок держать в контексте внутри хода (серия zoom)
@@ -164,29 +162,6 @@ RECENCY_BOOST_WEIGHT = 0.05
 RECENCY_HALFLIFE_DAYS = 30
 
 # ==================== TTS ====================
-
-# (OMNIVOICE)
-
-# Параметры модели
-OMNIVOICE_LANGUAGE = "ru"                     # язык синтеза
-OMNIVOICE_SPEED = 1.0                         # скорость (0.1-5.0)
-OMNIVOICE_INSTRUCT = "female, young adult, moderate pitch"   # конструктор голоса
-OMNIVOICE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"   # или "cpu"
-OMNIVOICE_DTYPE = "float16" if OMNIVOICE_DEVICE == "cuda" else "float32"
-
-# Путь для кэширования модели (если нужно)
-# OMNIVOICE_CACHE_DIR = os.path.join(BASE_DIR, "cache", "omnivoice")
-# Если не задан, модель загрузится в стандартную папку кэша
-
-# Дополнительно: можно задать отдельные атрибуты для удобства
-OMNIVOICE_ATTRIBUTES = {
-    "gender": "female",          # male / female
-    "age": "young adult",        # child / teenager / young adult / middle-aged / elderly
-    "pitch": "moderate pitch",   # very low / low / moderate / high / very high
-    "style": None,               # whisper (опционально)
-    "accent": None,              # american accent, british accent, ... (только для английского)
-    "dialect": None,             # 四川话 и т.п. (только для китайского)
-}
 
 # Silero принимает ТОЛЬКО одно из: 8000, 24000, 48000.
 # Раньше частота для apply_tts() не передавалась явно и угадывалась через
@@ -244,14 +219,4 @@ VECTOR_SEARCH_THRESHOLD = 0.75      # минимальный скор для в�
 
 EMOTION_WEBSOCKET_URL = "ws://127.0.0.1:8765"  # заглушка для аватара
 EMOTION_EXTRACTION_ENABLED = False   # пока отключено
-
-# ==================== ЛОГИРОВАНИЕ ====================
-
-LOG_LEVEL = "INFO"                 # DEBUG, INFO, WARNING, ERROR
-LOG_LATENCY = True                 # замерять задержки
-
-# ==================== ПРОЧЕЕ ====================
-
-# Потоки для работы с памятью
-MEMORY_IO_THREADS = 1               # количество потоков для записи/чтения (для блокировок)
 

@@ -21,11 +21,11 @@ HuggingFace                 intfloat/multilingual-e5-base (first run)
 
 ## Python libraries (requirements.txt)
 ```
-LLM/HTTP     requests, aiohttp
+LLM/HTTP     requests
 Speech       faster-whisper (STT, small, cpu int8), sounddevice, numpy
              torch + soundfile (Silero TTS, 48 kHz), pygame (playback), emoji (demojize ru)
 Memory       sentence-transformers, rank-bm25
-OS control   keyboard, pyperclip, pygetwindow
+OS control   keyboard, pyperclip
 Vision       Pillow (screenshots, zoom)
 Web          ddgs, trafilatura
 Optional     websocket-client (EmotionBridge)
@@ -34,7 +34,7 @@ Optional     websocket-client (EmotionBridge)
 ## Bundled binaries (gitignored)
 ```
 tts/          piper.exe + ru_RU-ruslan-medium.onnx, espeak-ng (not referenced by code; Silero is active)
-OMNIVOICE_* config used only by tests/tts_t.py
+scripts/tests/tts_t.py: standalone OmniVoice experiment (not used by the app)
 llama_things/ llama.cpp builds (mainline, bee_llama, turboquant*)
 models/       GGUF models
 ```

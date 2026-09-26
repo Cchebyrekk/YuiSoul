@@ -5,10 +5,9 @@
 """
 import os
 import re
-import json
 import threading
 import datetime
-from typing import List, Dict, Any
+from typing import List, Dict
 
 from rank_bm25 import BM25Okapi
 
@@ -19,7 +18,6 @@ from scripts.config import (
     AUTO_CONTEXT_MAX_CHARS,
     VECTOR_DUPLICATE_THRESHOLD,
     JACCARD_DUPLICATE_THRESHOLD,
-    VECTOR_SEARCH_THRESHOLD,
     FACT_CONFIDENCE_DROP_THRESHOLD,
     FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )

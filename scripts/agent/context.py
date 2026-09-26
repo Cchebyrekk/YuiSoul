@@ -8,13 +8,11 @@ import json
 import re
 import time
 import threading
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from scripts.config import (
     MAX_CONTEXT_CHARS,
     CONTEXT_TAIL_RATIO,
-    LLM_TIMEOUT,
-    MEMORY_DIR,
     LLM_API_URL,
     FACT_EXTRACTION_IDLE_DELAY
 )

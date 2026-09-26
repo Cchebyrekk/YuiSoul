@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
 """
-Общие утилиты: логирование, замер времени, вспомогательные функции.
+Общие утилиты: HTTP-сессия (http.py), язык фразы (lang.py).
 """
-from scripts.utils.latency import log_latency, measure_time
-
-__all__ = ['log_latency', 'measure_time']

@@ -16,7 +16,6 @@ import requests
 from typing import Optional
 
 from scripts.config import (
-    MEMORY_DIR,
     LLM_API_URL,
     REFLECTION_POLL_INTERVAL,
     REFLECTION_IDLE_THRESHOLD,
@@ -29,7 +28,6 @@ from scripts.config import (
     SLEEP_CONSOLIDATION_RECENT_BIAS,
     SLEEP_CONSOLIDATION_MAX_TOKENS,
     SLEEP_CONSOLIDATION_TEMPERATURE,
-    FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )
 from scripts.memory.manager import MemoryManager, parse_fact_line
 from scripts.agent.autonomy import seconds_since_activity
@@ -76,13 +74,14 @@ REFLECTION_PROMPT = (
     "<system_event>Время рефлексии. Вот самые свежие факты из твоей памяти:\n{facts}\n\n"
     "Подумай про себя: какие между ними связи и противоречия, что из этого следует для тебя и для "
     "ваших отношений с пользователем, чего ты не знаешь и что хотела бы уточнить. "
-    "Всё, что ты пишешь текстом, — мысли про себя, их никто не слышит. Можешь думать в несколько шагов:\n"
+    "Ты сейчас одна: весь твой текст — мысли про себя, пользователь их НЕ слышит. Поэтому думай о нём "
+    "в третьем лице и не обращайся к нему в мыслях. Можешь думать в несколько шагов:\n"
     "- стоит что-то проверить или узнать — поищи (search_web, read_webpage) или загляни в память (search_memory);\n"
     "- важные выводы сохрани через save_memory: о себе — в system/yui/yui_character или "
     "system/yui/yui_preferences, о пользователе — в user/..., общие наблюдения — в reflections/reflection_notes; "
     "если факт оказался неверным — сохрани исправление с отрицательным confidence;\n"
-    "- захочется что-то сказать или спросить вслух — speak_aloud.\n"
-    "Когда закончишь — вызови task_complete.</system_event>"
+    "- захочется что-то сказать или спросить у него — только через инструмент speak_aloud.\n"
+    "Когда закончишь — вызови инструмент task_complete (вызови, а не пиши об этом).</system_event>"
 )
 
 

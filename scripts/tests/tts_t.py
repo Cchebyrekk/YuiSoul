@@ -6,7 +6,6 @@
 
 import os
 import tempfile
-import time
 import torch
 import soundfile as sf
 import pygame
