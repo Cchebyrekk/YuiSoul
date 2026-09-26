@@ -366,6 +366,8 @@ class MemoryManager:
                 text = text.strip()
                 if not text:
                     continue
+                if confidence <= FACT_CONFIDENCE_DROP_THRESHOLD:
+                    continue  # опровергнуто — промпт сон-консолидации обещает, что такие факты удаляются
                 confidence = min(confidence, FACT_CONFIDENCE_ANCHOR_THRESHOLD - 0.01)
                 conf_tag = f"(c={confidence:+.2f}) " if confidence != 0.0 else ""
                 new_lines.append(f"- [{timestamp}] {conf_tag}{text}\n")
@@ -411,9 +413,12 @@ class MemoryManager:
             return "\n\n".join(all_content) if all_content else "Память пуста."
 
         if query.strip().startswith("FILE:"):
-            file_path = query.strip()[5:].strip()
-            if file_path.endswith(".md"):
-                file_path = file_path[:-3]
+            # Путь приходит из вывода модели (а её могла подговорить прочитанная страница):
+            # без проверки "FILE:C:/Users/.../notes" или "../.." читали бы любой .md на диске.
+            try:
+                file_path = self._validate_path(query.strip()[5:].strip())
+            except ValueError as e:
+                return f"Недопустимый путь: {e}"
             full_path = os.path.join(self.base_dir, f"{file_path}.md")
             if os.path.exists(full_path):
                 try:

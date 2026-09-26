@@ -10,6 +10,13 @@ tts/
 *.zip
 *.gguf
 
+# Downloaded voice model (54 MB; see TTS_SPEAKER_EN in config.py)
+scripts/speech/silero_model_en.pt
+
+# Test artifacts
+.coverage
+htmlcov/
+
 # Runtime data
 sessions/
 debug_logs/

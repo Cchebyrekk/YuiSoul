@@ -336,10 +336,15 @@ class ReflectionManager:
             print("[REFLECTION] sleep_consolidation: LLM не вернула ни одного распознанного факта, файлы не тронуты")
             return
 
-        touched_paths = set(involved) | set(new_by_path.keys())
+        # Переписываем только файлы, которые модели реально показали: путь, придуманный
+        # моделью, пропускаем. (Раньше условие сравнивало new_by_path само с собой и
+        # пропускало всё.) Показанный файл, который модель не упомянула, по договорённости
+        # в промпте "ничего не осталось" — его изменяемая часть очищается.
+        invented = set(new_by_path) - set(involved)
+        if invented:
+            print(f"[REFLECTION] sleep_consolidation: пропущены непоказанные пути {sorted(invented)}")
+        touched_paths = [path for path in involved if path in mutable_by_path or path in new_by_path]
         for path in touched_paths:
-            if path not in mutable_by_path and path not in new_by_path:
-                continue  # путь не участвовал (защита от того, что LLM придумала левый path)
             self.mm.rewrite_mutable_lines(path, new_by_path.get(path, []))
 
         print(f"[REFLECTION] sleep_consolidation: цель={target_path}, похожих={len(related_paths)}, "

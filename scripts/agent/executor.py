@@ -13,6 +13,8 @@ from typing import List, Dict, Any, Optional, Callable
 
 import emoji
 
+from scripts.utils.lang import text_language
+
 from scripts.tools.registry import build_registry
 from scripts.tools.vision import append_image_message
 from scripts.memory.manager import MemoryManager
@@ -33,8 +35,14 @@ except ImportError:
             return "neutral", 0.5
 
 
-def speech_text(text: str) -> str:
+# Незакрытый служебный блок или недописанный тег в конце буфера потоковой озвучки
+_UNCLOSED_TAG_RE = re.compile(r'<(emotion|thought|inner_thought)>(?![\s\S]*</\1>)|<[^>]*$')
+
+
+def speech_text(text: str, language: Optional[str] = None) -> str:
     """Текст для TTS: без XML-тегов и markdown-разметки (звёздочки, решётки, бэктики читались бы вслух)."""
+    # Служебные блоки — целиком, с содержимым: иначе "<emotion>curious, 0.6</emotion>" читалось бы вслух
+    text = re.sub(r'<(emotion|thought|inner_thought)>.*?</\1>', '', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', '', text)
     text = text.replace('```', '').replace('`', '')
     text = re.sub(r'(\*\*|__)(.+?)\1', r'\2', text)
@@ -43,7 +51,7 @@ def speech_text(text: str) -> str:
     # Эмодзи озвучиваются словами: 😏 -> "ухмыляется" (Silero сам их не читает).
     # Тон кожи убираем заранее, иначе вышло бы "большой палец вверх очень светлый тон кожи".
     text = re.sub('[\U0001F3FB-\U0001F3FF]', '', text)
-    text = emoji.demojize(text, language='ru', delimiters=('\x00', '\x01'))
+    text = emoji.demojize(text, language=language or text_language(text), delimiters=('\x00', '\x01'))
     text = re.sub('\x00([^\x01]*)\x01', lambda m: ' ' + m.group(1).replace('_', ' ') + ' ', text)
     text = re.sub(r'[ \t]{2,}', ' ', text)
     text = re.sub(r' ([,.!?;:])', r'\1', text)
@@ -256,17 +264,24 @@ class ActionExecutor:
         if not token or self.inner_mode:
             return  # мысли про себя не озвучиваются
         self._tts_buffer += token
+        # Внутри незакрытого тега ("<emotion>curious, 0." — точка из "0.6") фразу не отправляем
+        if _UNCLOSED_TAG_RE.search(self._tts_buffer):
+            return
         # Проверяем, закончилось ли предложение
         if self._tts_buffer.strip() and self._tts_buffer.strip()[-1] in '.!?':
-            clean = speech_text(self._tts_buffer)
-            if clean:
-                self.tts.speak(clean)
-            self._tts_buffer = ""
+            self._speak_buffer()
 
     def flush_tts_buffer(self):
         """Отправить остаток буфера после завершения стрима."""
         if self._tts_buffer.strip() and not self.inner_mode:
-            clean = speech_text(self._tts_buffer)
-            if clean:
-                self.tts.speak(clean)
+            self._speak_buffer()
+        self._tts_buffer = ""
+
+    def _speak_buffer(self):
+        # Язык фрагмента без слов (эмодзи) — как у соседних фраз ответа, чтобы "😊" посреди
+        # английского ответа не прозвучал русским голосом и наоборот.
+        self._speech_lang = text_language(self._tts_buffer, default=getattr(self, "_speech_lang", "ru"))
+        clean = speech_text(self._tts_buffer, language=self._speech_lang)
+        if clean:
+            self.tts.speak(clean)
         self._tts_buffer = ""

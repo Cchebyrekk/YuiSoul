@@ -15,6 +15,10 @@ from scripts.config import (
     WHISPER_DEVICE,
     WHISPER_COMPUTE_TYPE,
     STT_INPUT_DEVICE,
+    STT_LANGUAGE,
+    STT_LANGUAGES,
+    STT_LANGUAGE_DETECT_MODEL,
+    STT_LANGUAGE_MIN_CONFIDENCE,
     STT_SAMPLERATE,
     STT_BLOCK_DURATION,
     STT_SILENCE_BLOCKS,
@@ -51,6 +55,13 @@ class STTManager:
         """
         print(f"[STT] Загрузка Whisper ({WHISPER_MODEL_SIZE}) на {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})...")
         self.model = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+        # Несколько языков — язык фразы определяет отдельная крошечная модель (см. STT_LANGUAGES)
+        self.languages = tuple(STT_LANGUAGES) or (STT_LANGUAGE,)
+        self.language = STT_LANGUAGE
+        self.lid_model = None
+        if len(self.languages) > 1:
+            print(f"[STT] Определение языка ({'/'.join(self.languages)}) через Whisper {STT_LANGUAGE_DETECT_MODEL}...")
+            self.lid_model = WhisperModel(STT_LANGUAGE_DETECT_MODEL, device="cpu", compute_type="int8")
         self.input_queue = input_queue
         self.agent_busy = agent_busy_event
 
@@ -66,6 +77,25 @@ class STTManager:
 
         self._running = False
         self._thread: threading.Thread | None = None
+
+    def detect_language(self, audio: np.ndarray) -> str:
+        """
+        Язык фразы из разрешённых (STT_LANGUAGES). "Липкий": переключаемся, только если
+        модель уверена не меньше STT_LANGUAGE_MIN_CONFIDENCE — на коротком "да" tiny
+        ошибается с низкой уверенностью, и тогда остаётся язык предыдущих фраз.
+        """
+        if self.lid_model is None:
+            return self.language
+        try:
+            _, _, all_probs = self.lid_model.detect_language(audio)
+        except Exception as e:
+            print(f"[STT] Не удалось определить язык: {e}")
+            return self.language
+        probs = dict(all_probs)
+        best = max(self.languages, key=lambda lang: probs.get(lang, 0.0))
+        if probs.get(best, 0.0) >= STT_LANGUAGE_MIN_CONFIDENCE:
+            self.language = best
+        return self.language
 
     def start(self):
         """Запускает поток прослушивания микрофона."""
@@ -131,14 +161,18 @@ class STTManager:
                         if silence_counter > self.silence_blocks:
                             # Объединяем блоки в один массив
                             audio_data = np.concatenate(recording).flatten().astype(np.float32)
-                            audio_duration = len(audio_data) / self.samplerate
+                            # Длина речи — без хвоста тишины, которого мы ждали (STT_SILENCE_BLOCKS ≈ 2.7 с):
+                            # иначе любой щелчок "длиннее" STT_MIN_AUDIO_LENGTH и уходит в Whisper.
+                            speech_blocks = len(recording) - silence_counter
+                            audio_duration = speech_blocks * self.block_duration
 
                             # Проверяем минимальную длину (отсекаем шумы)
                             if audio_duration > self.min_audio_length:
                                 # Транскрибируем
+                                language = self.detect_language(audio_data)
                                 segments, info = self.model.transcribe(
                                     audio_data,
-                                    language=None,
+                                    language=language,
                                     beam_size=1,
                                     vad_filter=True
                                 )
@@ -149,9 +183,10 @@ class STTManager:
                                     is_interrupt = self.agent_busy.is_set()
                                     metadata = {
                                         "timestamp": time.time(),
-                                        "interrupted": is_interrupt
+                                        "interrupted": is_interrupt,
+                                        "language": language
                                     }
-                                    print(f"\n[STT VOICE INPUT] (Interrupt: {is_interrupt}): {text}")
+                                    print(f"\n[STT VOICE INPUT] ({language}, Interrupt: {is_interrupt}): {text}")
                                     self.input_queue.put(("voice", text, metadata))
 
                             # Сбрасываем состояние
