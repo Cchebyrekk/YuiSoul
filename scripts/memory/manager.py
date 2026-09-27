@@ -17,7 +17,8 @@ from scripts.config import (
     AUTO_CONTEXT_MAX_LINES_PER_FILE,
     AUTO_CONTEXT_MAX_CHARS,
     VECTOR_DUPLICATE_THRESHOLD,
-    JACCARD_DUPLICATE_THRESHOLD,
+    DUPLICATE_WORD_OVERLAP,
+    VECTOR_SEARCH_STRONG_THRESHOLD,
     FACT_CONFIDENCE_DROP_THRESHOLD,
     FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )
@@ -69,6 +70,103 @@ def parse_fact_line(line: str):
     return path, confidence, text
 
 
+# ---------- Слова фактов: основы и «отличительные» слова ----------
+
+STOP_WORDS = {
+    'и','в','во','не','что','он','на','я','с','со','как','а','то',
+    'все','она','так','его','но','да','ты','к','у','же','вы','за',
+    'бы','по','только','ее','мне','было','вот','от','меня','еще','нет',
+    'о','из','ему','теперь','когда','даже','ну','вдруг','ли','если',
+    'уже','или','ни','быть','был','него','до','вас','нибудь','опять',
+    'уж','вам','ведь','там','потом','себя','ничего','ей','может','они',
+    'тут','где','есть','надо','ней','для','мы','тебя','их','чем','была',
+    'сам','чтоб','без','будто','чего','раз','тоже','себе','под','будет',
+    'ж','тогда','кто','этот','того','потому','этого','какой','совсем',
+    'ним','здесь','этом','один','почти','мой','тем','чтобы','нее','сейчас',
+    'были','куда','зачем','всех','никогда','можно','при','наконец','два',
+    'об','другой','хоть','после','над','больше','тот','через','эти','нас',
+    'про','всего','них','какая','много','разве','три','эту','моя','впрочем',
+    'хорошо','свою','этой','перед','иногда','лучше','чуть','том','нельзя',
+    'такой','им','более','всегда','конечно','всю','между',
+    # есть почти в каждом факте о пользователе, и слова-время — общими словами не считаются
+    # (иначе «посоветуй фильм на вечер» находил «слушает синтвейв по вечерам»)
+    'пользователь','пользователя','пользователю','пользователем','пользователе',
+    'вечер','вечером','вечерам','вечера','утро','утром','день','днём','ночью','сегодня','завтра',
+    'вчера','час','время','какую','каким','каком','сколько','моего','моей','мою','мои',
+    'the','and','what','my','your','you','is','are','was','how','who','for','with','that','this',
+}
+_ENDINGS = sorted(['ями', 'ами', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'иям', 'иях', 'ешь', 'ишь',
+                   'ях', 'ах', 'ов', 'ев', 'ей', 'ой', 'ий', 'ый', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие', 'ую',
+                   'юю', 'ом', 'ем', 'ам', 'ям', 'их', 'ых', 'ть', 'ет', 'ют', 'ит', 'ат', 'ят', 'им',
+                   'а', 'я', 'ы', 'и', 'у', 'ю', 'е', 'о', 'ь'], key=len, reverse=True)
+
+
+def _stem(word: str) -> str:
+    """Грубая основа русского слова: без одного окончания и не длиннее 6 букв («кота» = «кот», «грибами» = «грибы»)."""
+    word = word.lower().replace('ё', 'е')
+    for ending in _ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 3:
+            word = word[:-len(ending)]
+            break
+    return word[:6]
+
+
+def content_stems(text: str) -> set:
+    """Основы значимых слов (без стоп-слов и слов короче 3 букв)."""
+    return {_stem(w) for w in re.findall(r"[a-zа-яё]+", text.lower().replace('ё', 'е'))
+            if len(w) > 2 and w not in STOP_WORDS}
+
+
+def distinct_tokens(text: str) -> set:
+    """Имена (слова с заглавной не в начале), числа и латиница: по ним различаются похожие факты."""
+    tokens = set()
+    for m in re.finditer(r"[A-Za-zА-Яа-яЁё]+|\d+", text):
+        w = m.group(0)
+        # Заглавная в начале предложения — не имя («…контентом. Предпочитает…»)
+        sentence_start = not text[:m.start()].strip() or text[:m.start()].rstrip()[-1] in '.!?…'
+        if w.isdigit() or re.search(r'[A-Za-z]', w) or (w[0].isupper() and not sentence_start):
+            tokens.add(w if w.isdigit() else _stem(w))
+    return tokens
+
+
+def same_fact(a: str, b: str) -> bool:
+    """
+    Один и тот же факт другими словами. Отличающиеся имена/числа/латиница — всегда разные факты
+    («Кота зовут Барсик» и «Кота зовут Мурзик», «любит Z.A.T.O.» и «любит Katawa Shoujo»).
+    """
+    if distinct_tokens(a) != distinct_tokens(b):
+        return False
+    sa, sb = content_stems(a), content_stems(b)
+    if not sa or not sb:
+        return False
+    return len(sa & sb) / min(len(sa), len(sb)) >= DUPLICATE_WORD_OVERLAP
+
+
+# Модель при сохранении каждый раз изобретала путь заново, и одна тема расползалась по файлам:
+# user/interests и system/user/interests, yui/character и system/yui/yui_character, рефлексии
+# в четырёх местах. Канонические пути — ровно те, что читают SoulManager и рефлексия.
+_PATH_ALIASES = [
+    (r'^system/user/', 'user/'),
+    (r'^yui/(?:yui_)?', 'system/yui/yui_'),
+    (r'^system/yui/(?!yui_)', 'system/yui/yui_'),
+    (r'^system/yui/yui_(?:tastes?|likes|memory_structure)$', 'system/yui/yui_preferences'),
+    (r'^system/pc/(?!pc_)', 'system/pc/pc_'),
+    (r'^(?:system/)?(?:reflections?|reflective)(?:/.*)?$', 'reflections/reflection_notes'),
+]
+
+
+def canonical_path(path: str) -> str:
+    """Приводит путь факта к канонической структуре памяти (см. _PATH_ALIASES)."""
+    for pattern, replacement in _PATH_ALIASES:
+        path = re.sub(pattern, replacement, path, flags=re.IGNORECASE)
+    return path
+
+
+def is_relevant(query_stems: set, score: float, fact: str) -> bool:
+    """Факт подходит запросу: очень похожий по смыслу — или похожий и с общим значимым словом."""
+    return score >= VECTOR_SEARCH_STRONG_THRESHOLD or bool(query_stems & content_stems(fact))
+
+
 class MemoryManager:
     def __init__(self, base_dir: str = MEMORY_DIR):
         self.base_dir = base_dir
@@ -110,7 +208,7 @@ class MemoryManager:
         if not sanitized_parts:
             return "misc/default"
 
-        final_path = "/".join(sanitized_parts)
+        final_path = canonical_path("/".join(sanitized_parts))
         if len(final_path) > 80:
             final_path = final_path[:80]
         return final_path
@@ -118,24 +216,7 @@ class MemoryManager:
     def _tokenize_russian(self, text: str) -> list:
         """Токенизация с удалением стоп-слов для BM25."""
         words = re.findall(r'[a-zа-яё0-9]+', text.lower())
-        stop_words = {
-            'и','в','во','не','что','он','на','я','с','со','как','а','то',
-            'все','она','так','его','но','да','ты','к','у','же','вы','за',
-            'бы','по','только','ее','мне','было','вот','от','меня','еще','нет',
-            'о','из','ему','теперь','когда','даже','ну','вдруг','ли','если',
-            'уже','или','ни','быть','был','него','до','вас','нибудь','опять',
-            'уж','вам','ведь','там','потом','себя','ничего','ей','может','они',
-            'тут','где','есть','надо','ней','для','мы','тебя','их','чем','была',
-            'сам','чтоб','без','будто','чего','раз','тоже','себе','под','будет',
-            'ж','тогда','кто','этот','того','потому','этого','какой','совсем',
-            'ним','здесь','этом','один','почти','мой','тем','чтобы','нее','сейчас',
-            'были','куда','зачем','всех','никогда','можно','при','наконец','два',
-            'об','другой','хоть','после','над','больше','тот','через','эти','нас',
-            'про','всего','них','какая','много','разве','три','эту','моя','впрочем',
-            'хорошо','свою','этой','перед','иногда','лучше','чуть','том','нельзя',
-            'такой','им','более','всегда','конечно','всю','между'
-        }
-        return [w for w in words if len(w) > 2 and w not in stop_words]
+        return [w for w in words if len(w) > 2 and w not in STOP_WORDS]
 
     def _memory_fingerprint(self) -> tuple:
         """
@@ -198,40 +279,45 @@ class MemoryManager:
     # ---------- Основные методы ----------
     def save_fact(self, path: str, content: str, confidence: float = 0.0) -> str:
         """
-        Сохраняет факт в файл памяти с дедупликацией (векторная + Жаккард).
+        Сохраняет факт в файл памяти с дедупликацией.
+
+        Дубль — это тот же факт другими словами (см. same_fact) с высоким смысловым сходством
+        отдельной строки (VECTOR_DUPLICATE_THRESHOLD). Дубль в другом файле — факт не пишется;
+        дубль в этом же файле — старая строка заменяется новой. Похожие, но разные факты
+        («Барсик рыжий» и «Мурзик чёрный») сохраняются оба.
 
         :param confidence: доверие к факту, см. _CONFIDENCE_TAG_RE выше.
             confidence <= FACT_CONFIDENCE_DROP_THRESHOLD трактуется как
-            РЕТРАКЦИЯ: вместо записи новой строки ищутся и удаляются похожие
-            старые строки (это опровержение, а не новый факт) — если только
-            они не являются anchor-строками (confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD),
+            РЕТРАКЦИЯ: вместо записи новой строки ищутся и удаляются те же факты
+            (это опровержение, а не новый факт) — если только они не являются
+            anchor-строками (confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD),
             которые сон-консолидация и обычное опровержение не имеют права трогать.
         Возвращает строку статуса.
         """
         try:
             validated = self._validate_path(path)
             full_path = os.path.join(self.base_dir, f"{validated}.md")
+            new_fact = content.strip()
+            is_retraction = confidence <= FACT_CONFIDENCE_DROP_THRESHOLD
+
+            duplicates = []
+            if not is_retraction:
+                duplicates = [hit for hit in self.vector_engine.search_lines(new_fact, top_k=5,
+                                                                             threshold=VECTOR_DUPLICATE_THRESHOLD)
+                              if same_fact(new_fact, hit["line"])]
+                if any(hit["id"] != validated for hit in duplicates):
+                    return "[MEMORY] ACK. Факт уже существует в памяти под другим путём."
+            duplicate_lines = {hit["line"] for hit in duplicates}
 
             with self._file_lock:
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-                new_fact = content.strip()
-                is_retraction = confidence <= FACT_CONFIDENCE_DROP_THRESHOLD
-
                 if is_retraction and not os.path.exists(full_path):
                     return "[MEMORY] Опровержение принято, но похожих фактов не найдено."
 
-                if not is_retraction:
-                    # Векторная проверка на дубли во всей базе (ретракции это не касается —
-                    # мы ищем что удалить, а не проверяем "уже есть ли такое").
-                    dup_check = self.vector_engine.search(new_fact, top_k=1)
-                    if dup_check and dup_check[0]['score'] > VECTOR_DUPLICATE_THRESHOLD:
-                        if dup_check[0]['id'] != validated:
-                            return "[MEMORY] ACK. Факт уже существует в памяти под другим путём."
-
                 lines_to_write = []
-                new_words = set(w for w in re.findall(r'\w+', new_fact.lower()) if len(w) > 2)
                 removed_count = 0
+                confirmed_by_anchor = False
 
                 if os.path.exists(full_path):
                     with open(full_path, "r", encoding="utf-8") as f:
@@ -242,30 +328,26 @@ class MemoryManager:
                         if not clean_line:
                             continue
                         line_without_ts = re.sub(r'\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', clean_line)
-                        old_confidence, line_without_tag = _strip_confidence_tag(line_without_ts)
-                        old_words = set(w for w in re.findall(r'\w+', line_without_tag.lower()) if len(w) > 2)
+                        old_confidence, old_fact = _strip_confidence_tag(line_without_ts)
+                        old_fact = old_fact.strip()
                         is_anchor = old_confidence >= FACT_CONFIDENCE_ANCHOR_THRESHOLD
+                        matches = same_fact(new_fact, old_fact) if is_retraction else old_fact in duplicate_lines
 
-                        if not new_words or not old_words:
+                        if matches and is_anchor:
+                            # Anchor-факты (подтверждённая истина) неприкосновенны:
+                            # ни обычная перезапись, ни ретракция не могут их убрать.
+                            confirmed_by_anchor = not is_retraction
                             lines_to_write.append(line)
-                            continue
-                        intersection = len(new_words.intersection(old_words))
-                        union = len(new_words.union(old_words))
-                        jaccard = intersection / union if union > 0 else 0
-
-                        if jaccard >= JACCARD_DUPLICATE_THRESHOLD:
-                            if is_anchor:
-                                # Anchor-факты (подтверждённая истина) неприкосновенны:
-                                # ни обычная перезапись, ни ретракция не могут их убрать.
-                                lines_to_write.append(line)
-                            else:
-                                removed_count += 1
-                                continue  # пропускаем старую строку (заменяем/удаляем)
+                        elif matches:
+                            removed_count += 1  # старая строка заменяется новой / удаляется ретракцией
                         else:
                             lines_to_write.append(line)
 
+                if confirmed_by_anchor:
+                    return "[MEMORY] ACK. Это уже подтверждено в памяти."
+
                 if is_retraction:
-                    # Ретракция ничего не добавляет — только удаляет похожее.
+                    # Ретракция ничего не добавляет — только удаляет тот же факт.
                     status = (f"[MEMORY] Опровержение принято, удалено строк: {removed_count}."
                               if removed_count else "[MEMORY] Опровержение принято, но похожих фактов не найдено.")
                 else:
@@ -427,15 +509,17 @@ class MemoryManager:
                     return "Ошибка чтения файла."
             return "Файл не найден."
 
-        # Векторный поиск
-        vector_results = self.vector_engine.search(query, top_k=top_k)
-        if vector_results:
-            output = []
-            for res in vector_results:
-                content = res['text']
-                if len(content) > 300:
-                    content = content[:300] + "\n[...ОБРЕЗАНО]"
-                output.append(f"Файл: {res['id']} (Сходство: {res['score']:.2f})\n{content}\n")
+        # Векторный поиск по отдельным фактам: показываем только подошедшие факты
+        query_stems = content_stems(query)
+        output = []
+        for res in self.vector_engine.search(query, top_k=top_k * 3):
+            facts = [fact for score, fact in res.get("hits", []) if is_relevant(query_stems, score, fact)]
+            if facts:
+                listed = "\n".join(f"- {f}" for f in facts[:5])
+                output.append(f"Файл: {res['id']} (Сходство: {res['score']:.2f})\n{listed}\n")
+            if len(output) >= top_k:
+                break
+        if output:
             return "\n".join(output)
 
         # Fallback: BM25
@@ -468,61 +552,31 @@ class MemoryManager:
                          max_lines: int = AUTO_CONTEXT_MAX_LINES_PER_FILE,
                          max_chars: int = AUTO_CONTEXT_MAX_CHARS) -> str:
         """
-        Извлекает релевантные строки из памяти для автоматической инъекции в контекст.
+        Факты из памяти, подходящие к реплике, — для автоматической инъекции в контекст каждого хода.
+        Ничего не подошло — пустая строка: лучше ничего, чем случайный факт (раньше на любую реплику
+        подмешивалась последняя строка найденного файла, и на «как дела?» Юи видела «мама живёт в Казани»).
         """
-        vector_results = self.vector_engine.search(query, top_k=max_files)
-        if not vector_results:
-            return ""
-
-        query_words = set(w for w in re.findall(r'[a-zа-яё0-9]+', query.lower()) if len(w) > 2)
-
-        context_lines = []
-        normalized_lines = set()
-        total_len = 0
-
-        for res in vector_results:
-            lines = res['text'].split('\n')
-            file_snippets = []
-
-            for line in lines:
-                snippet = re.sub(r'^[-*\s]+', '', line).strip()
-                snippet = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', snippet).strip()
-                _, snippet = _strip_confidence_tag(snippet)
-                snippet = snippet.strip()
-                if not snippet:
+        query_stems = content_stems(query)
+        context_lines, seen, total_len, files_used = [], set(), 0, 0
+        for res in self.vector_engine.search(query, top_k=max_files * 3):
+            taken = 0
+            for score, fact in res.get("hits", []):
+                if taken >= max_lines or not is_relevant(query_stems, score, fact):
                     continue
-                snippet_words = set(w for w in re.findall(r'[a-zа-яё0-9]+', snippet.lower()) if len(w) > 2)
-                if query_words.intersection(snippet_words):
-                    file_snippets.append(snippet)
-                if len(file_snippets) >= max_lines:
-                    break
-
-            # Фолбэк: если нет совпадений по словам, берём последнюю непустую строку
-            if not file_snippets:
-                for line in reversed(lines):
-                    snippet = re.sub(r'^[-*\s]+', '', line).strip()
-                    snippet = re.sub(r'^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}\]\s*', '', snippet).strip()
-                    _, snippet = _strip_confidence_tag(snippet)
-                    snippet = snippet.strip()
-                    if snippet:
-                        file_snippets.append(snippet)
-                        break
-
-            for snippet in file_snippets:
-                norm = re.sub(r'[^a-zа-яё0-9]', '', snippet.lower())
-                if not norm or norm in normalized_lines:
+                norm = re.sub(r'[^a-zа-яё0-9]', '', fact.lower())
+                if not norm or norm in seen:
                     continue
-                normalized_lines.add(norm)
-                to_add = f"- {snippet}."
+                to_add = f"- {fact.rstrip('.')}."
                 if total_len + len(to_add) > max_chars:
-                    break
+                    return "\n".join(context_lines)
+                seen.add(norm)
                 context_lines.append(to_add)
                 total_len += len(to_add)
-
-            if total_len >= max_chars:
+                taken += 1
+            files_used += bool(taken)
+            if files_used >= max_files:
                 break
-
-        return "\n".join(context_lines) if context_lines else ""
+        return "\n".join(context_lines)
 
     def get_fact_extraction_prompt(self, history_to_compress: List[Dict[str, str]], tree_str: str = "") -> str:
         """
@@ -537,12 +591,14 @@ class MemoryManager:
 1. ЗАПРЕЩЕНО писать рассуждения, анализ, слова "Анализ", "Шаг". ПИШИ ТОЛЬКО ИТОГОВЫЕ ФАКТЫ.
 2. Формат строго построчный: [категория/тема] Текст факта.
 3. ПРАВИЛА КАТЕГОРИЙ (ВЫПОЛНЯТЬ СТРОГО):
-   - О пользователе (вкусы, имя, привычки) -> [user/...] (пример: [user/dislikes] Не любит ботов).
-   - О тебе (твои мысли, реакции, ошибки) -> [system/yui/yui_...] 
-   - О ПК, железе, коде -> [system/pc/pc_...]
-   - О животных, растениях, природе -> ОБЯЗАТЕЛЬНО СОЗДАВАЙ НОВУЮ ПАПКУ (пример: [biology/axolotls] Аксолотли это...).
-   - Об остальных вещах (еда, фильмы) -> ОБЯЗАТЕЛЬНО СОЗДАВАЙ НОВУЮ ПАПКУ (пример: [food/sweets] Любит трубочки).
-4. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО смешивать темы. Аксолотли НЕЛЬЗЯ класть в папку user или system. Для них всегда создается своя тема.
+   - СНАЧАЛА ищи подходящий файл в структуре памяти выше и пиши туда. Новый файл — только если
+     подходящего правда нет. Не создавай синонимы существующих файлов (tastes при наличии preferences).
+   - Всё о пользователе — его вкусы, интересы, привычки, люди вокруг, настроение — [user/...]:
+     [user/interests] Любит аксолотлей. [user/profile] Зовут Вадим. [user/family] Сестру зовут Лена.
+   - О тебе самой: черты характера -> [system/yui/yui_character], что нравится/не нравится -> [system/yui/yui_preferences].
+   - О ПК, железе -> [system/pc/pc_...].
+   - Знания о мире, не о пользователе и не о тебе -> своя тема: [biology/axolotls] Аксолотли умеют регенерировать.
+4. Один факт — одна строка. Не повторяй то, что уже есть в памяти другими словами.
 5. Если фактов нет, пиши только: NULL
 6. ОПРОВЕРЖЕНИЕ: если из истории ясно, что пользователь ИСПРАВИЛ тебя, и что-то,
    во что ты раньше верила, ОКАЗАЛОСЬ НЕПРАВДОЙ — не пиши новый факт поверх старого,

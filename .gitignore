@@ -22,3 +22,4 @@ htmlcov/
 sessions/
 debug_logs/
 memory/
+memory_backup_*/
