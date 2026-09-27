@@ -211,9 +211,17 @@ AUTO_CONTEXT_MAX_LINES_PER_FILE = 2
 AUTO_CONTEXT_MAX_CHARS = 400
 
 # Пороги сходства для дедупликации
-VECTOR_DUPLICATE_THRESHOLD = 0.90   # косинус > 0.90 – дубль
-JACCARD_DUPLICATE_THRESHOLD = 0.4   # Жаккард >= 0.4 – дубль внутри файла
-VECTOR_SEARCH_THRESHOLD = 0.75      # минимальный скор для выдачи результатов
+# Пороги откалиброваны на настоящей e5 (python -m evals.retrieval_eval). e5 сжимает сходства в узкую
+# полосу: нужные факты 0.75-0.84, посторонние запросы до 0.80 — одним порогом их не разделить.
+# Дубль факта: косинус >= VECTOR_DUPLICATE_THRESHOLD (настоящие дубли 0.886-0.920, разные факты
+# 0.786-0.868) И доля общих основ слов >= DUPLICATE_WORD_OVERLAP И одинаковые имена/числа/латиница:
+# «Кота зовут Барсик» и «Кота зовут Мурзик» — разные факты.
+VECTOR_DUPLICATE_THRESHOLD = 0.87
+DUPLICATE_WORD_OVERLAP = 0.5
+# Релевантность факта запросу: косинус >= VECTOR_SEARCH_STRONG_THRESHOLD (выше любого постороннего
+# запроса в замере) или >= VECTOR_SEARCH_THRESHOLD и общее значимое слово (с учётом окончаний).
+VECTOR_SEARCH_THRESHOLD = 0.76
+VECTOR_SEARCH_STRONG_THRESHOLD = 0.81
 
 # ==================== ЭМОЦИОНАЛЬНЫЙ КАНАЛ ====================
 

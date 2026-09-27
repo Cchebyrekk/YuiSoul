@@ -40,6 +40,22 @@ def test_validate_path_stays_inside_memory(mm, raw, expected):
     assert mm._validate_path(raw) == expected
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("system/user/interests", "user/interests"),
+    ("yui/character", "system/yui/yui_character"),
+    ("yui/yui_preferences", "system/yui/yui_preferences"),
+    ("system/yui/tastes", "system/yui/yui_preferences"),
+    ("system/pc/vram", "system/pc/pc_vram"),
+    ("system/reflections", "reflections/reflection_notes"),
+    ("system/reflective/inner_thoughts", "reflections/reflection_notes"),
+    ("reflections/reflection_notes", "reflections/reflection_notes"),
+    ("user/pets", "user/pets"),
+])
+def test_paths_are_canonical(mm, raw, expected):
+    """Регрессия: модель изобретала путь заново, и одна тема расползалась по 2-4 файлам."""
+    assert mm._validate_path(raw) == expected
+
+
 def test_validate_path_rejects_deep_nesting(mm):
     with pytest.raises(ValueError):
         mm._validate_path("a/b/c/d")
@@ -179,6 +195,42 @@ def test_rewrite_to_empty_removes_file_from_index(mm, memory_dir):
     mm.save_fact("user/pets", "Кот рыжий")
     mm.rewrite_mutable_lines("user/pets", [])
     assert all(m["id"] != "user/pets" for m in mm.vector_engine.metadata)
+
+
+# ---------- дубли и релевантность (регрессия по ревью памяти) ----------
+
+@pytest.mark.parametrize("a, b, same", [
+    ("Кота пользователя зовут Барсик, он рыжий.", "Кот пользователя — рыжий Барсик.", True),
+    ("Кота пользователя зовут Барсик.", "Кота пользователя зовут Мурзик.", False),      # раньше затиралось
+    ("Пользователь любит визуальную новеллу Z.A.T.O.", "Пользователь любит визуальную новеллу Katawa Shoujo.", False),
+    ("Сестру пользователя зовут Лена, её день рождения 3 марта.", "День рождения сестры Лены — 3 марта.", True),
+    ("Барсику 5 лет.", "Барсику 6 лет.", False),                                        # числа различаются
+    ("Пользователь не ест грибы.", "Пользователь не любит грибы и не ест их.", True),
+])
+def test_same_fact(a, b, same):
+    from scripts.memory.manager import same_fact
+    assert same_fact(a, b) is same
+
+
+def test_stems_match_word_forms():
+    from scripts.memory.manager import content_stems
+    assert content_stems("Как зовут моего кота?") & content_stems("Кот рыжий")
+    assert content_stems("суп с грибами") & content_stems("не ест грибы")
+    assert not content_stems("фильм на вечер") & content_stems("слушает синтвейв по вечерам")
+
+
+def test_similar_but_different_facts_both_kept(mm, memory_dir):
+    mm.save_fact("user/pets", "Кота пользователя зовут Барсик")
+    mm.save_fact("user/pets", "Кота пользователя зовут Мурзик")
+    text = (memory_dir / "user" / "pets.md").read_text(encoding="utf-8")
+    assert "Барсик" in text and "Мурзик" in text
+
+
+def test_auto_context_adds_nothing_unrelated(mm):
+    mm.save_fact("user/family", "Мама пользователя живёт в Казани")
+    mm.vector_engine.threshold = -1.0            # заглушка эмбеддингов: пропускаем всё мимо порога
+    assert mm.get_auto_context("привет как дела") == ""           # нет общих слов — ничего (раньше: последняя строка)
+    assert "Казани" in mm.get_auto_context("где живёт мама")
 
 
 def test_fact_extraction_prompt_mentions_history(mm):

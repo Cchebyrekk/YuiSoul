@@ -17,11 +17,11 @@ def test_add_update_remove_and_persist(memory_dir):
     engine.add_document("user/pets", "Кот рыжий Барсик")
     engine.add_document("user/food", "Любит пиццу")
     engine.add_document("user/pets", "Кот рыжий Барсик пушистый")  # обновление, не дубль
-    assert [m["id"] for m in engine.metadata] == ["user/pets", "user/food"]
-    assert engine.metadata[0]["text"].endswith("пушистый")
+    assert sorted(m["id"] for m in engine.metadata) == ["user/food", "user/pets"]
+    assert engine.docs["user/pets"]["text"].endswith("пушистый")
 
     reloaded = VectorSearchEngine()  # индекс читается с диска
-    assert [m["id"] for m in reloaded.metadata] == ["user/pets", "user/food"]
+    assert sorted(m["id"] for m in reloaded.metadata) == ["user/food", "user/pets"]
 
     engine.remove_document("user/pets")
     engine.remove_document("user/missing")  # несуществующий — no-op
@@ -37,6 +37,28 @@ def test_search_filters_by_threshold_and_ranks(memory_dir):
     results = engine.search("Кот рыжий Барсик", top_k=5)
     assert [r["id"] for r in results] == ["user/pets"]
     assert results[0]["score"] > engine.threshold
+
+
+def test_index_is_per_fact(memory_dir):
+    engine = make_engine(memory_dir)
+    engine.add_document("user/pets", "- [2026-09-20 10:00] (c=+1.00) Кот рыжий Барсик\n# заголовок\n- Барсик спит на клавиатуре")
+    assert [line["text"] for line in engine.lines] == ["Кот рыжий Барсик", "Барсик спит на клавиатуре"]
+    hits = engine.search_lines("кот рыжий барсик", top_k=1)
+    assert hits[0]["id"] == "user/pets" and hits[0]["line"] == "Кот рыжий Барсик"
+    result = engine.search("кот рыжий барсик")[0]
+    assert result["lines"][0] == "Кот рыжий Барсик" and result["text"].startswith("- [2026")
+
+
+def test_old_file_level_index_is_rebuilt(memory_dir):
+    import json
+    import numpy as np
+    (memory_dir / "user").mkdir()
+    (memory_dir / "user" / "pets.md").write_text("- Кот рыжий\n- Кот спит\n", encoding="utf-8")
+    np.save(memory_dir / "vectors.npy", np.zeros((1, 4)))            # формат v1: вектор на файл
+    (memory_dir / "metadata.json").write_text(json.dumps([{"id": "user/pets", "text": "- Кот рыжий"}]), encoding="utf-8")
+    engine = make_engine(memory_dir)
+    assert [line["text"] for line in engine.lines] == ["Кот рыжий", "Кот спит"]
+    assert json.loads((memory_dir / "metadata.json").read_text(encoding="utf-8"))["version"] == 2
 
 
 def test_recency_factor():

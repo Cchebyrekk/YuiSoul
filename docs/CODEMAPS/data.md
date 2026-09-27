@@ -10,7 +10,7 @@ memory/                         long-term memory (MEMORY_DIR, gitignored)
   system/yui/yui_preferences.md YUI's likes/dislikes           (via save_memory)
   system/pc/*.md                hardware facts
   reflections/reflection_*.md   ReflectionManager output, read by SoulManager
-  vectors.npy + metadata.json   VectorSearchEngine index (doc_id -> embedding)
+  vectors.npy + metadata.json   VectorSearchEngine index v2: one embedding per FACT line ({docs, lines})
 sessions/latest.json            {"saved_at", "messages"} chat history, base64 images stripped
 debug_logs/                     runtime logs
 ```
@@ -25,9 +25,11 @@ debug_logs/                     runtime logs
 ## Flows
 ```
 save_fact(path, content, conf)
-  -> dedupe: vector cosine > 0.90 | Jaccard >= 0.4 within file
+  -> dedupe: search_lines cosine >= 0.87 AND same_fact (word-stem overlap >= 0.5, same names/numbers/latin)
+     other file -> ACK (skip); same file -> replace line
   -> append line to .md -> VectorSearchEngine.add_document
-search_facts(query) = vector (e5-base, >= 0.75) + BM25 (cached index) + recency boost
+relevance: cosine >= 0.81, or >= 0.76 + shared stem (is_relevant); tuned by evals/retrieval_eval.py
+search_facts(query) = relevant facts per file (vector) -> BM25 fallback; recency boost for ranking
 get_auto_context(query) -> <= 3 files x 2 lines, <= 400 chars -> injected_context
 extract_and_save_facts(history)  LLM extracts facts -> save_fact
   called: end of turn (loop.py:312-352) and on compress_context (dropped msgs, bg)
