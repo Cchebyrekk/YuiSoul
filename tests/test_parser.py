@@ -72,3 +72,33 @@ def test_preamble_removed_and_reset():
     assert reply == "Настоящий ответ"
     parser.reset()
     assert parser.content_buffer == "" and parser.tool_calls == []
+
+
+def test_numbered_thinking_written_as_reply_is_reasoning():
+    leak = "Here's a thinking process that leads to the suggested response:\n\n1.  **Analyze the Input:**\n    * blah"
+    reply, reasoning, _, _ = feed(StreamParser(), {"content": leak})
+    assert reply == "" and "Analyze the Input" in reasoning
+
+
+def test_broken_and_repeated_tool_calls_are_sanitized():
+    # замерено: зациклившаяся модель — task_complete с незакрытым JSON; в истории он ломал каждый запрос (500)
+    from scripts.agent.parser import sanitize_tool_calls
+    broken = '{"reason":"Рефлексия завершена: ...</result>\n</function>\n</tool_call>\n<tool_call>'
+    calls = [{"id": "1", "function": {"name": "task_complete", "arguments": broken}},
+             {"id": "2", "function": {"name": "task_complete", "arguments": broken}},
+             {"id": "3", "function": {"name": "save_memory", "arguments": '{"path": "user/a", "content": "x"}'}}]
+    clean = sanitize_tool_calls(calls)
+    assert [(c["id"], c["function"]["arguments"]) for c in clean] == [
+        ("1", "{}"), ("3", '{"path": "user/a", "content": "x"}')]
+
+
+def test_session_heals_poisoned_history(tmp_path, monkeypatch):
+    import json
+    import scripts.agent.session as session_mod
+    path = tmp_path / "latest.json"
+    poisoned = [{"role": "system", "content": "s"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "1", "function": {"name": "task_complete", "arguments": '{"reason":"незакрыт'}}]}]
+    path.write_text(json.dumps({"saved_at": "x", "messages": poisoned}, ensure_ascii=False), encoding="utf-8")
+    loaded = session_mod.load_session(str(path))
+    assert loaded[1]["tool_calls"][0]["function"]["arguments"] == "{}"

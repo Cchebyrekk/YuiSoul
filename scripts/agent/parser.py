@@ -8,6 +8,31 @@ import json
 import re
 from typing import Dict, List, Tuple, Optional, Any
 
+MAX_TOOL_ARGUMENTS_CHARS = 20000  # больше — это не аргументы, а зацикленная генерация
+
+
+def sanitize_tool_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Вызовы инструментов, безопасные для истории: аргументы — валидный JSON (иначе {}), без повторов одного и того же.
+    Замерено: зациклившаяся модель выдала task_complete с 7.6 тыс. символов незакрытого JSON; он попал в историю,
+    и llama-server отвечал 500 на КАЖДЫЙ следующий запрос с этой историей («отравленная» сессия).
+    """
+    clean, seen = [], set()
+    for call in calls or []:
+        function = call.get("function") or {}
+        name, args = function.get("name"), function.get("arguments") or "{}"
+        try:
+            if len(args) > MAX_TOOL_ARGUMENTS_CHARS or not isinstance(json.loads(args), dict):
+                raise ValueError("слишком длинные или не объект")
+        except (ValueError, TypeError):
+            print(f"[PARSER] Испорченные аргументы вызова {name} ({len(args)} симв.) — заменены на {{}}.")
+            args = "{}"
+        if (name, args) in seen:
+            continue  # тот же вызов ещё раз подряд — повтор зациклившейся модели
+        seen.add((name, args))
+        clean.append({**call, "function": {**function, "arguments": args}})
+    return clean
+
 
 class StreamParser:
     """
@@ -147,7 +172,14 @@ class StreamParser:
         if output_match:
             final_reply = output_match.group(1).strip()
 
-        # 7. Финальная очистка от преамбул (если модель их всё-таки выдала)
+        # 7. Финальная очистка от преамбул (если модель их всё-таки выдала).
+        # Ответ, начатый как разбор задачи по-английски («Here's a thinking process that leads to...»), — это
+        # рассуждения целиком, написанные в ответ (замерено): иначе их продолжение ушло бы в TTS и в Telegram.
+        # Однострочная преамбула перед настоящим ответом — ниже просто вырезается; разбор по пунктам — целиком.
+        if re.match(r"\s*(Here's a thinking process|Thinking Process:|The user wants me to)[^\n]*\n\s*(\d+\.|[*-])\s",
+                    final_reply):
+            reasoning = f"{reasoning}\n{final_reply}".strip()
+            final_reply = ""
         preamble_patterns = [
             r'^\s*Here\'s a thinking process:.*?(?=\n|<output>|$)',
             r'^\s*Thinking Process:.*?(?=\n|<output>|$)',
@@ -173,6 +205,7 @@ class StreamParser:
             self_reported_emotion = (name, intensity)
             final_reply = re.sub(r'<emotion>.*?</emotion>', '', final_reply, flags=re.DOTALL).strip()
 
+        self.tool_calls = sanitize_tool_calls(self.tool_calls)
         return final_reply, reasoning, self.tool_calls, self_reported_emotion
 
     def _extract_text_tool_calls(self, text: str) -> str:

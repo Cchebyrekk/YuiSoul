@@ -6,16 +6,18 @@
 speak_aloud) и сама сохраняет выводы через save_memory. Раз в N циклов —
 фоновая сон-консолидация памяти.
 """
+import datetime
 import os
 import queue
 import random
 import threading
 import time
 import re
-import requests
 from typing import Optional
 
 from scripts.config import (
+    FACT_CONFIDENCE_ANCHOR_THRESHOLD,
+    FACT_CONFIDENCE_DROP_THRESHOLD,
     LLM_API_URL,
     REFLECTION_POLL_INTERVAL,
     REFLECTION_IDLE_THRESHOLD,
@@ -29,45 +31,99 @@ from scripts.config import (
     SLEEP_CONSOLIDATION_MAX_TOKENS,
     SLEEP_CONSOLIDATION_TEMPERATURE,
 )
-from scripts.memory.manager import MemoryManager, parse_fact_line
+from scripts.memory.manager import MemoryManager
 from scripts.agent.autonomy import seconds_since_activity
 from scripts.utils.http import SESSION
 
 
-# Адаптация sleepConsolidator из kuni под файловую (по темам, не по-записям)
-# память YUI. LLM никогда не присваивает anchor-уровень доверия сама —
-# rewrite_mutable_lines() на всякий случай обрезает confidence и на своей
-# стороне, это лишь явное объяснение для модели, почему так.
-SLEEP_CONSOLIDATOR_PROMPT = """Ты — фаза сна YUI. Как человеческий мозг во время сна, ты переупаковываешь
-дневные воспоминания: сжимаешь повторы, объединяешь похожие факты, находишь противоречия
-и присваиваешь им доверие (confidence).
+# Сон по образцу sleepConsolidator из kuni, но безопасный для файловой памяти YUI (замерено пробным
+# прогоном на копии памяти: прежний вариант склеивал по 8 разных фактов в одну строку, раздавал доверие
+# +0.5..+0.95 без оснований, терял факты, сбрасывал даты и за цикл переписывал ещё 3 соседних файла).
+# Теперь модель отвечает правками по номерам фактов ОДНОГО файла; всё, что она не упомянула, остаётся
+# как было (обрезанный ответ ничего не стирает), а изменения доверия ограничены кодом.
+SLEEP_CONSOLIDATOR_PROMPT = """Ты — фаза сна YUI. Как мозг во сне, ты перебираешь воспоминания одного файла памяти:
+убираешь повторы, уточняешь формулировки и сверяешь факты между собой.
 
-confidence ∈ [-1..1]: -1 = опровергнуто/ложь (такие факты будут УДАЛЕНЫ), 0 = теория/предположение
-(по умолчанию), 1 = подтверждённая истина. ТЕБЕ ЗАПРЕЩЕНО присваивать confidence=1 или выше 0.99
-— это может сделать только человек/система вручную, не ты.
+Факты файла пронумерованы: [N] (c=доверие) текст. Доверие: -1 = ложь, 0 = предположение, 1 = подтверждено
+человеком (такие помечены ЯКОРЬ — их не трогай, им не противоречь). Ниже — факты из похожих файлов, только
+для сверки: их менять нельзя.
 
-Часть фактов помечена как "# ANCHOR" — это неприкосновенная подтверждённая истина, дана
-ТОЛЬКО для контекста. Не переписывай её, не противоречь ей, не включай её в свой ответ.
+Ответ — ТОЛЬКО правки, по одной в строке, без пояснений:
+[N] (c=X.XX) новый текст — переписать факт N (короче, яснее) и/или поменять доверие;
+[N,M] (c=X.XX) текст — N и M — это ОДИН И ТОТ ЖЕ факт разными словами: слить в одну строку;
+[N] (c=-1) — факт N ложен: противоречит якорю или нескольким надёжным фактам;
+[N] (?) — сомневаешься в факте N: его стоит уточнить у пользователя.
 
-Для остальных (изменяемых) фактов, идущих под заголовками "# путь/к/файлу":
-- объединяй дубли и почти-дубли в один факт;
-- переписывай растянутые/неясные формулировки короче и по делу;
-- если факт противоречит другому факту или ANCHOR — понижай его confidence, вплоть до -1;
-- если факт независимо подтверждается несколькими записями — можно немного повысить confidence
-  (но не выше 0.99);
-- НЕ придумывай фактов, которых не было во входных данных;
-- сохраняй фактическое ядро, спекуляции явно помечай как предположение.
+Правила:
+- НЕ сливай разные факты в одну строку (кот и собака, татуировка и аниме — это разные факты);
+- переписывая, не выбрасывай детали: имена, числа, с кем, когда;
+- дубль (тот же факт другими словами) — слей через [N,M], а не помечай ложью;
+- доверие повышай, только если факт независимо подтверждают другие записи; понижай — если ему что-то противоречит;
+- ничего не придумывай; не упомянутые тобой факты остаются как есть — правь только то, что правда нужно;
+- нечего править — ответь одним словом: НЕТ."""
 
-Формат ответа — СТРОГО построчно, без пояснений, без преамбул:
-[путь/к/файлу] (c=X.XX) Текст факта.
+SLEEP_MAX_RAISE = 0.2        # на сколько за одну ночь можно поднять доверие
+SLEEP_MAX_LOWER = 0.4        # на сколько опустить (кроме явного -1 — «ложь»)
+SLEEP_CONF_CEILING = 0.9     # выше сон не поднимает: до 1 — только подтверждение пользователем
+SLEEP_MAX_MERGE = 3          # больше фактов в одну строку не сливаем (защита от «простыней»)
+SLEEP_MAX_DELETE_SHARE = 1 / 3  # за ночь удаляем не больше трети файла (ошибка модели не выкосит память)
 
-Пример:
-[user/pets] (c=0.30) Кот пользователя по кличке Барсик, рыжий.
-[system/yui/yui_mood] (c=-1) Пользователь любит собак.
+_SLEEP_EDIT_RE = re.compile(r'^\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\s*(?:\(\s*(\?|c\s*=\s*[+-]?\d+(?:\.\d+)?)\s*\))?\s*(.*)$')
 
-Если для какого-то файла после сжатия ничего не осталось — просто не упоминай его путь в ответе.
-Если факт остаётся годным как есть — можешь переписать его почти без изменений с тем же confidence.
-"""
+
+def parse_sleep_edits(raw: str) -> list:
+    """Строки ответа сна -> [{"ids": [..], "confidence": float|None, "doubt": bool, "text": str}]."""
+    edits = []
+    for line in (raw or "").splitlines():
+        m = _SLEEP_EDIT_RE.match(line.strip().lstrip("-* ").strip())
+        if not m:
+            continue
+        ids = [int(i) for i in re.findall(r'\d+', m.group(1))]
+        tag, text = m.group(2) or "", m.group(3).strip()
+        doubt = tag == "?" or text.endswith("(?)")
+        confidence = float(re.sub(r'[^\d.+-]', '', tag)) if tag.startswith("c") else None
+        edits.append({"ids": ids, "confidence": confidence, "doubt": doubt,
+                      "text": re.sub(r'\s*\(\?\)$', '', text).strip()})
+    return edits
+
+
+def apply_sleep_edits(records: list, edits: list) -> tuple:
+    """
+    Правки сна -> (новые записи, удалённые тексты, сомнительные тексты). Якоря (доверие 1) и всё, что модель
+    не упомянула, не меняются; даты сохраняются (у слитого факта — самая ранняя).
+    """
+    n = len(records)
+    result = {i: dict(r) for i, r in enumerate(records, 1)}
+    used, deleted, doubtful = set(), [], []
+    max_deletes = max(1, int(n * SLEEP_MAX_DELETE_SHARE))
+    for edit in edits:
+        ids = [i for i in dict.fromkeys(edit["ids"]) if 1 <= i <= n and i not in used
+               and records[i - 1]["confidence"] < FACT_CONFIDENCE_ANCHOR_THRESHOLD]
+        if not ids or len(ids) != len(set(edit["ids"])) or len(ids) > SLEEP_MAX_MERGE:
+            continue  # чужие/повторные номера, якорь или «простыня» — правку целиком пропускаем
+        sources = [records[i - 1] for i in ids]
+        base = max(s["confidence"] for s in sources)
+        if edit["doubt"] and edit["confidence"] is None:
+            doubtful.extend(s["text"] for s in sources)
+            continue
+        if edit["confidence"] is not None and edit["confidence"] <= FACT_CONFIDENCE_DROP_THRESHOLD:
+            if len(deleted) + len(ids) > max_deletes:
+                continue
+            for i in ids:
+                deleted.append(result.pop(i)["text"])
+            used.update(ids)
+            continue
+        conf = base if edit["confidence"] is None else edit["confidence"]
+        conf = round(max(base - SLEEP_MAX_LOWER, min(conf, base + SLEEP_MAX_RAISE, SLEEP_CONF_CEILING)), 2)
+        dates = [s["date"] for s in sources if s["date"]]
+        result[ids[0]] = {"date": min(dates) if dates else None, "confidence": conf,
+                          "text": edit["text"] or sources[0]["text"]}
+        for i in ids[1:]:
+            result.pop(i)
+        used.update(ids)
+        if edit["doubt"]:
+            doubtful.append(result[ids[0]]["text"])
+    return [result[i] for i in sorted(result)], deleted, doubtful
 
 
 REFLECTION_PROMPT = (
@@ -81,8 +137,12 @@ REFLECTION_PROMPT = (
     "system/yui/yui_preferences, о пользователе — в user/..., общие наблюдения — в reflections/reflection_notes; "
     "если факт оказался неверным — сохрани исправление с отрицательным confidence;\n"
     "- захочется что-то сказать или спросить у него — только через инструмент speak_aloud.\n"
+    "{doubtful}"
     "Когда закончишь — вызови инструмент task_complete (вызови, а не пиши об этом).</system_event>"
 )
+
+DOUBTFUL_NOTE = ("- во сне ты засомневалась в этих фактах; если какой-то правда важен — уточни у пользователя "
+                 "(verify_fact, по одному, не больше одного за раз):\n{facts}\n")
 
 
 class ReflectionManager:
@@ -115,6 +175,9 @@ class ReflectionManager:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._cycle_count = 0
+        self.on_doubtful = None  # (path, text) — факт, который сон счёл сомнительным (см. FactVerifier)
+        self.doubtful = None     # () -> список «под вопросом» для подсказки рефлексии
+        self.dreams = None       # DreamWeaver — сны после сна (ставит loop)
 
     def is_due(self) -> bool:
         """Основной цикл перепроверяет это перед запуском: пока задача ждала в очереди, пользователь мог заговорить."""
@@ -173,6 +236,16 @@ class ReflectionManager:
                 except Exception as e:
                     print(f"[REFLECTION] sleep_consolidation error: {e}")
 
+            # Сон со сновидением: не чаще раза в сутки, ночью или после долгой тишины (см. memory/dreams.py)
+            agent_busy_now = self.agent_is_working is not None and self.agent_is_working.is_set()
+            dream_due = (self.dreams is not None and not agent_busy_now
+                         and self.dreams.due(datetime.datetime.now(), seconds_since_activity()))
+            if dream_due:
+                try:
+                    self.dreams.weave()
+                except Exception as e:
+                    print(f"[DREAM] Ошибка: {e}")
+
     def _recent_facts(self) -> list:
         """Самые свежие факты из памяти (кроме папки reflections), по дате записи."""
         all_facts = []
@@ -202,7 +275,10 @@ class ReflectionManager:
         if len(facts) < REFLECTION_MIN_FACTS:
             print(f"[REFLECTION] Пропуск: в памяти {len(facts)} фактов, нужно хотя бы {REFLECTION_MIN_FACTS}.")
             return
-        prompt = REFLECTION_PROMPT.format(facts="\n".join(f"- {f}" for f in facts))
+        doubtful = self.doubtful() if self.doubtful is not None else []
+        doubtful_note = DOUBTFUL_NOTE.format(facts="\n".join(
+            f"  [{d['path']}] {d['text']}" for d in doubtful[-5:])) if doubtful else ""
+        prompt = REFLECTION_PROMPT.format(facts="\n".join(f"- {f}" for f in facts), doubtful=doubtful_note)
         self.input_queue.put(("reflection", prompt, {"timestamp": time.time(), "facts": len(facts)}))
 
     def force_reflection(self):
@@ -215,7 +291,7 @@ class ReflectionManager:
         """Список путей (без .md) всех файлов памяти, кроме служебной папки reflections/."""
         paths = []
         for root, _, files in os.walk(self.mm.base_dir):
-            if "reflections" in root.split(os.sep):
+            if {"reflections", "diary"} & set(root.split(os.sep)):  # заметки и дневник чувств сон не переписывает
                 continue
             for file in files:
                 if not file.endswith(".md"):
@@ -239,112 +315,65 @@ class ReflectionManager:
 
     def _run_sleep_consolidation_cycle(self):
         """
-        Один цикл сон-консолидации: берём один файл памяти (с уклоном в
-        сторону свежих), подмешиваем похожие через векторный поиск,
-        просим LLM сжать/объединить/переписать/опровергнуть изменяемую
-        (не-anchor) часть и переписываем результат на диск.
-
-        В отличие от kuni (который крутит цикл "пока не кончится время сна"
-        по ВСЕЙ памяти за один присест), здесь обрабатывается один целевой
-        файл за один вызов: этот метод и так вызывается периодически из
-        фонового потока, а держать поток занятым долгим циклом рискованно
-        для отзывчивости stop()/join(timeout=5).
+        Одна «ночь» для одного файла памяти (с уклоном в сторону свежих, как у kuni): модель видит его факты
+        под номерами и похожие факты из других файлов (только для сверки) и отвечает правками по номерам —
+        см. SLEEP_CONSOLIDATOR_PROMPT и apply_sleep_edits. Меняется только этот файл.
+        Сомнительные факты уходят в self.on_doubtful(path, text) — Юи потом может уточнить их у пользователя.
         """
         candidates = self._list_topic_paths()
         if not candidates:
             return
-
         target_path = self._pick_sleep_target(candidates)
-        target_anchors, target_mutable = self.mm.read_mutable_and_anchor_lines(target_path)
-        if not target_mutable:
-            return  # нечего сжимать — либо пусто, либо только anchor-факты
+        records = self.mm.read_fact_records(target_path)
+        if not any(r["confidence"] < FACT_CONFIDENCE_ANCHOR_THRESHOLD for r in records):
+            return  # пусто или одни якоря — сверять нечего
 
-        query_text = "\n".join(text for _, text in target_mutable)
-        related = self.mm.vector_engine.search(query_text, top_k=SLEEP_CONSOLIDATION_RELATED_FILES + 1)
-        related_paths = [r["id"] for r in related if r["id"] != target_path][:SLEEP_CONSOLIDATION_RELATED_FILES]
+        def fmt(i, r):
+            anchor = " ЯКОРЬ" if r["confidence"] >= FACT_CONFIDENCE_ANCHOR_THRESHOLD else ""
+            return f"[{i}] (c={r['confidence']:+.2f}{anchor}) {r['text']}"
 
-        involved = [target_path] + related_paths
-        mutable_by_path = {target_path: target_mutable}
-        anchor_context_parts = []
-        if target_anchors:
-            anchor_context_parts.append(
-                f"# ANCHOR (неприкосновенно, только контекст) — {target_path}\n"
-                + "\n".join(f"(c={c:+.2f}) {t}" for c, t in target_anchors)
-            )
-
-        body_parts = [f"# {target_path}\n" + "\n".join(f"(c={c:+.2f}) {t}" for c, t in target_mutable)]
-        for path in related_paths:
-            anchors, mutable = self.mm.read_mutable_and_anchor_lines(path)
-            if anchors:
-                anchor_context_parts.append(
-                    f"# ANCHOR (неприкосновенно, только контекст) — {path}\n"
-                    + "\n".join(f"(c={c:+.2f}) {t}" for c, t in anchors)
-                )
-            if mutable:
-                mutable_by_path[path] = mutable
-                body_parts.append(f"# {path}\n" + "\n".join(f"(c={c:+.2f}) {t}" for c, t in mutable))
-
-        prompt_body = ""
-        if anchor_context_parts:
-            prompt_body += "\n\n".join(anchor_context_parts) + "\n\n---\n\n"
-        prompt_body += "\n\n---\n\n".join(body_parts)
-
+        related = self.mm.vector_engine.search("\n".join(r["text"] for r in records),
+                                               top_k=SLEEP_CONSOLIDATION_RELATED_FILES + 1)
+        context = []
+        for res in related:
+            if res["id"] == target_path:
+                continue
+            others = self.mm.read_fact_records(res["id"])
+            if others:
+                context.append(f"# {res['id']}\n" + "\n".join(f"- (c={r['confidence']:+.2f}) {r['text']}" for r in others))
+        prompt = (f"# Файл: {target_path}\n" + "\n".join(fmt(i, r) for i, r in enumerate(records, 1))
+                  + ("\n\n## Для сверки (менять нельзя)\n" + "\n\n".join(context[:SLEEP_CONSOLIDATION_RELATED_FILES])
+                     if context else ""))
         try:
             response = SESSION.post(
                 LLM_API_URL,
                 json={
                     "messages": [
                         {"role": "system", "content": SLEEP_CONSOLIDATOR_PROMPT},
-                        {"role": "user", "content": prompt_body},
+                        {"role": "user", "content": prompt},
                     ],
                     "max_tokens": SLEEP_CONSOLIDATION_MAX_TOKENS,
                     "temperature": SLEEP_CONSOLIDATION_TEMPERATURE,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
-                timeout=120.0,
+                timeout=180.0,
             )
             if response.status_code != 200:
-                print(f"[REFLECTION] sleep_consolidation: LLM ответил {response.status_code}")
+                print(f"[SLEEP] LLM ответил {response.status_code}")
                 return
             raw = (response.json()["choices"][0]["message"].get("content") or "").strip()
-        except requests.exceptions.RequestException as e:
-            print(f"[REFLECTION] sleep_consolidation: ошибка HTTP: {e}")
-            return
         except Exception as e:
-            print(f"[REFLECTION] sleep_consolidation: ошибка запроса: {e}")
+            print(f"[SLEEP] Ошибка запроса: {e}")
             return
 
-        new_by_path = {}
-        for line in raw.split("\n"):
-            line = line.strip("- *").strip()
-            if not line:
-                continue
-            parsed = parse_fact_line(line)
-            if not parsed:
-                continue
-            path, confidence, text = parsed
-            if len(text) < 5:
-                continue
-            new_by_path.setdefault(path, []).append((confidence, text))
-
-        if not new_by_path:
-            # Пустой/нераспарсенный ответ — вероятно, сбой модели, а не
-            # "все факты оказались мусором". Ничего не трогаем на диске,
-            # чтобы одна неудачная генерация не стёрла изменяемые факты
-            # у involved-файлов, которые LLM просто не успела упомянуть.
-            print("[REFLECTION] sleep_consolidation: LLM не вернула ни одного распознанного факта, файлы не тронуты")
-            return
-
-        # Переписываем только файлы, которые модели реально показали: путь, придуманный
-        # моделью, пропускаем. (Раньше условие сравнивало new_by_path само с собой и
-        # пропускало всё.) Показанный файл, который модель не упомянула, по договорённости
-        # в промпте "ничего не осталось" — его изменяемая часть очищается.
-        invented = set(new_by_path) - set(involved)
-        if invented:
-            print(f"[REFLECTION] sleep_consolidation: пропущены непоказанные пути {sorted(invented)}")
-        touched_paths = [path for path in involved if path in mutable_by_path or path in new_by_path]
-        for path in touched_paths:
-            self.mm.rewrite_mutable_lines(path, new_by_path.get(path, []))
-
-        print(f"[REFLECTION] sleep_consolidation: цель={target_path}, похожих={len(related_paths)}, "
-              f"переписано файлов={len(touched_paths)}")
+        new_records, deleted, doubtful = apply_sleep_edits(records, parse_sleep_edits(raw))
+        changed = new_records != records
+        if changed:
+            self.mm.write_fact_records(target_path, new_records)
+        for text in doubtful:
+            if self.on_doubtful is not None:
+                self.on_doubtful(target_path, text)
+        print(f"[SLEEP] {target_path}: фактов {len(records)} -> {len(new_records)}"
+              f"{', удалено как ложные: ' + '; '.join(deleted) if deleted else ''}"
+              f"{', под вопросом: ' + str(len(doubtful)) if doubtful else ''}{'' if changed else ' (без изменений)'}")
+        return {"path": target_path, "before": records, "after": new_records, "deleted": deleted, "doubtful": doubtful}

@@ -39,6 +39,7 @@ def env(monkeypatch, mm, memory_dir, llm):
         return loop.run_agent_loop(task, messages=messages, max_steps=max_steps, input_queue=q or queue.Queue(),
                                    memory_manager=mm, soul_manager=SoulManager(base_dir=str(memory_dir)),
                                    tts_manager=tts, executor=executor, inner=inner)
+    run.executor = executor
     return run, llm, tts
 
 
@@ -217,3 +218,156 @@ def test_llm_error_then_step_limit(env):
     llm.responses += [FakeResponse("ошибка", status_code=500)] * 3
     messages = run("привет", max_steps=1)
     assert messages[-1]["role"] == "user"   # ответа нет, но цикл завершился штатно
+
+
+THINKING_LEAK = "Here's a thinking process that leads to the suggested response:\n\n1. **Analyze the Input:** ..."
+
+
+def test_reasoning_only_reply_gets_one_retry_then_answer(env):
+    run, llm, tts = env
+    # рассуждения съели весь лимит токенов — ответа нет (как в логе)
+    llm.responses += [FakeResponse(lines=sse({"reasoning_content": THINKING_LEAK})),
+                      FakeResponse(lines=sse({"content": "Хорошо, молчу."}))]
+    messages = run("не отвечай пока")
+    assert messages[-1] == {"role": "assistant", "content": "Хорошо, молчу."}
+    assert sum(m["role"] == "assistant" for m in messages) == 1          # пустая реплика не осталась в истории
+    retry = llm.requests[1]["messages"]
+    assert retry[-2]["role"] == "user" and "только рассуждения" in retry[-1]["content"]
+    assert llm.requests[1]["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_reasoning_only_twice_ends_turn_without_400_loop(env):
+    run, llm, tts = env
+    llm.responses += [FakeResponse(lines=sse({"reasoning_content": THINKING_LEAK})),
+                      FakeResponse(lines=sse({"content": THINKING_LEAK}))]      # и в ответ целиком
+    messages = run("не отвечай пока", max_steps=10)
+    assert len(llm.requests) == 2 and messages[-1]["role"] == "user"
+
+
+def test_inner_turn_thinks_only_on_first_step(env):
+    run, llm, tts = env
+    llm.responses += [FakeResponse(lines=sse(tool_call("save_memory", {"path": "user/a", "content": "Факт номер один"}))),
+                      FakeResponse(lines=sse(tool_call("task_complete", {"reason": "всё"}, "c2")))]
+    run("<system_event>подумай</system_event>", inner="autonomy")
+    assert [r["chat_template_kwargs"]["enable_thinking"] for r in llm.requests] == [True, False]
+
+
+class Interrupted(FakeResponse):
+    """Поток, прерванный Ctrl+C посреди ответа."""
+    def iter_lines(self):
+        yield b'data: {"choices": [{"delta": {"content": "\xd0\x9f\xd1\x80\xd0\xb8"}}]}'
+        raise KeyboardInterrupt
+
+
+def test_ctrl_c_closes_stream_saves_and_exits(env, monkeypatch):
+    run, llm, tts = env
+    saved = []
+    monkeypatch.setattr(loop, "extract_and_save_facts", lambda *a, **kw: saved.append(kw))
+    response = Interrupted()
+    llm.responses.append(response)
+    with pytest.raises(KeyboardInterrupt):                     # раньше ход возвращался в цикл, и программа висела
+        run("привет")
+    assert getattr(response, "closed", False)                 # сервер перестаёт генерировать брошенный ответ
+    assert saved and saved[0]["max_wait"] == loop.FACT_SAVE_ON_EXIT_WAIT
+
+
+def test_next_input_waits_in_short_steps():
+    q = queue.Queue()
+    q.put(("text", "привет", {}))
+    assert loop.next_input(q)[1] == "привет"
+
+
+# ---------- самоповторы ----------
+
+LONG = "Мне правда интересно, что ты думаешь о визуальных новеллах и их сюжетах."
+
+
+def test_antirepeat_unit(mm):
+    from scripts.agent.antirepeat import AntiRepeat
+    ar = AntiRepeat.from_model(mm.vector_engine.model)
+    ar.remember(LONG)
+    assert ar.check(LONG) == LONG
+    assert ar.check("Совсем другая тема: погода сегодня отличная, солнце и тепло.") is None
+    ar.remember("Привет!")
+    assert ar.check("Привет!") is None                          # короткие не проверяются
+
+
+def test_repeat_in_telegram_is_rephrased_before_sending(env, mm):
+    from scripts.agent.antirepeat import AntiRepeat
+    from test_telegram import OWNER, make_bot
+    run, llm, tts = env
+    llm.responses += [FakeResponse(lines=sse({"content": LONG})), FakeResponse(lines=sse({"content": "А у тебя как день?"}))]
+    ex = run.executor
+    ex.antirepeat = AntiRepeat.from_model(mm.vector_engine.model)
+    ex.antirepeat.remember(LONG)
+    ex.telegram, _ = make_bot()
+    ex.reply_channel = {"chat_id": OWNER, "voice": False}
+    try:
+        run("привет")
+    finally:
+        ex.reply_channel = None
+    assert [p["text"] for p in ex.telegram.http.sent("sendMessage")] == ["А у тебя как день?"]
+    assert "почти повторила" in llm.requests[1]["messages"][-1]["content"]
+
+
+def test_repeat_at_pc_gets_hint_next_turn(env, mm):
+    from scripts.agent.antirepeat import AntiRepeat
+    run, llm, tts = env
+    ex = run.executor
+    ex.antirepeat = AntiRepeat.from_model(mm.vector_engine.model)
+    ex.antirepeat.remember(LONG)
+    llm.responses += [FakeResponse(lines=sse({"content": LONG})), FakeResponse(lines=sse({"content": "Окей."}))]
+    messages = run("привет")
+    assert len(llm.requests) == 1                               # голос уже прозвучал — не переспрашиваем
+    run("как дела", messages=messages)
+    assert any("почти повторила" in m["content"] for m in llm.requests[1]["messages"] if isinstance(m["content"], str))
+
+
+def test_speak_aloud_repeat_is_rejected(env, mm):
+    from scripts.agent.antirepeat import AntiRepeat
+    run, llm, tts = env
+    ex = run.executor
+    ex.antirepeat = AntiRepeat.from_model(mm.vector_engine.model)
+    ex.antirepeat.remember(LONG)
+    llm.responses += [FakeResponse(lines=sse(tool_call("speak_aloud", {"text": LONG}))),
+                      FakeResponse(lines=sse(tool_call("task_complete", {"reason": "всё"}, "c2")))]
+    messages = run("<system_event>подумай</system_event>", inner="autonomy")
+    assert tts.said == []
+    assert any("Отклонено: это почти повторяет" in str(m.get("content")) for m in messages)
+
+
+# ---------- зацикливание модели на вызовах инструментов (500 от llama-server) ----------
+
+LOOP_500 = FakeResponse(status_code=500, content='{"error":{"code":500,"message":"Failed to parse tool call '
+                                                  'arguments as JSON: ... task_complete ... task_complete ..."}}')
+
+
+def test_degenerate_inner_turn_ends_without_retries(env):
+    run, llm, tts = env
+    llm.responses.append(LOOP_500)
+    run("<system_event>подумай</system_event>", inner="reflection")
+    assert len(llm.requests) == 1                      # раньше: 3 повтора на каждый из 8 шагов
+
+
+def test_degenerate_user_turn_gets_one_careful_retry(env):
+    run, llm, tts = env
+    llm.responses += [LOOP_500, FakeResponse(lines=sse({"content": "Готово."}))]
+    messages = run("открой блокнот")
+    assert messages[-1]["content"] == "Готово."
+    careful = llm.requests[1]
+    assert careful["temperature"] <= 0.3 and careful["repeat_penalty"] == loop.SAFE_MODE_REPEAT_PENALTY
+
+
+def test_degenerate_twice_ends_user_turn(env):
+    run, llm, tts = env
+    llm.responses += [LOOP_500, LOOP_500]
+    run("открой блокнот", max_steps=10)
+    assert len(llm.requests) == 2
+
+
+def test_inner_later_steps_are_short(env):
+    run, llm, tts = env
+    llm.responses += [FakeResponse(lines=sse(tool_call("save_memory", {"path": "user/a", "content": "Факт номер один"}))),
+                      FakeResponse(lines=sse(tool_call("task_complete", {"reason": "всё"}, "c2")))]
+    run("<system_event>подумай</system_event>", inner="autonomy")
+    assert llm.requests[1]["max_tokens"] <= loop.INNER_STEP_MAX_TOKENS

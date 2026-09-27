@@ -3,12 +3,13 @@
 Модуль распознавания речи (STT) на основе faster-whisper.
 Записывает звук с микрофона, определяет паузы, транскрибирует и отправляет текст в очередь.
 """
+import io
 import queue
 import threading
 import time
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, decode_audio
 
 from scripts.config import (
     WHISPER_MODEL_SIZE,
@@ -47,6 +48,8 @@ class STTManager:
     Запускает фоновый поток, который слушает микрофон и при обнаружении фразы
     отправляет текст в очередь input_queue вместе с метаданными.
     """
+    # Микрофон и голосовые из Telegram распознаются одной моделью — по очереди
+    _transcribe_lock = threading.Lock()
 
     def __init__(self, input_queue: queue.Queue, agent_busy_event: threading.Event):
         """
@@ -96,6 +99,17 @@ class STTManager:
         if probs.get(best, 0.0) >= STT_LANGUAGE_MIN_CONFIDENCE:
             self.language = best
         return self.language
+
+    def transcribe_audio(self, audio: np.ndarray) -> tuple:
+        """(текст, язык) для 16 кГц моно. Под блокировкой: микрофон и голосовые из Telegram — одна модель."""
+        with self._transcribe_lock:
+            language = self.detect_language(audio)
+            segments, _ = self.model.transcribe(audio, language=language, beam_size=1, vad_filter=True)
+            return " ".join(seg.text for seg in segments).strip(), language
+
+    def transcribe_bytes(self, data: bytes) -> tuple:
+        """То же для аудиофайла в памяти (голосовое из Telegram — ogg/opus)."""
+        return self.transcribe_audio(decode_audio(io.BytesIO(data), sampling_rate=STT_SAMPLERATE))
 
     def start(self):
         """Запускает поток прослушивания микрофона."""
@@ -168,15 +182,7 @@ class STTManager:
 
                             # Проверяем минимальную длину (отсекаем шумы)
                             if audio_duration > self.min_audio_length:
-                                # Транскрибируем
-                                language = self.detect_language(audio_data)
-                                segments, info = self.model.transcribe(
-                                    audio_data,
-                                    language=language,
-                                    beam_size=1,
-                                    vad_filter=True
-                                )
-                                text = " ".join([seg.text for seg in segments]).strip()
+                                text, language = self.transcribe_audio(audio_data)
 
                                 if text and len(text) > 1:
                                     # Определяем, был ли агент занят во время речи

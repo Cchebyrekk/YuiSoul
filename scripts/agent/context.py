@@ -16,7 +16,7 @@ from scripts.config import (
     LLM_API_URL,
     FACT_EXTRACTION_IDLE_DELAY
 )
-from scripts.memory.manager import MemoryManager, parse_fact_line
+from scripts.memory.manager import MemoryManager, parse_fact_lines
 from scripts.agent.prompt import get_dynamic_state
 from scripts.utils.http import SESSION
 from scripts.tools.vision import content_text, message_chars
@@ -79,10 +79,13 @@ def compress_context(messages: List[Dict[str, str]], memory_manager: Optional[Me
     return new_messages
 
 
-def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: MemoryManager, wait: bool = False):
+def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: MemoryManager, wait: bool = False,
+                           max_wait: Optional[float] = None, force_path: Optional[str] = None,
+                           tools: Optional[list] = None):
     """
     Извлекает факты из истории (обычно из удалённой части) и сохраняет в память.
-    Работает в фоновом потоке, если wait=False.
+    Работает в фоновом потоке, если wait=False. max_wait — сколько секунд ждать при wait=True
+    (выход по Ctrl+C: занятый сервер не должен держать Юи минутами).
     """
     if not history:
         return
@@ -130,7 +133,7 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
                 "chat_template_kwargs": {"enable_thinking": False},
             }
             if prefix:
-                payload["tools"] = TOOLS  # инструменты входят в отрисованный промпт — без них префикс не совпадёт
+                payload["tools"] = tools or TOOLS  # инструменты входят в отрисованный промпт — без них префикс не совпадёт
             # Потоком — чтобы фоновое извлечение можно было оборвать: закрытие соединения
             # останавливает генерацию в llama-server и сразу освобождает его единственный слот.
             payload["stream"] = True
@@ -168,9 +171,9 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
                     continue
                 if any(line.lower().startswith(kw) for kw in garbage_keywords):
                     continue
-                parsed = parse_fact_line(line)
-                if parsed:
-                    path, confidence, fact = parsed
+                for path, confidence, fact in parse_fact_lines(line):
+                    # Разговор с гостем из Telegram — только в его файл, не в память о владельце
+                    path = force_path or path
                     if len(fact) > 5:
                         valid_facts.add((path, fact, confidence))
 
@@ -186,7 +189,16 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
 
     # Запуск в фоновом потоке или синхронно
     if wait:
-        _worker()
+        if max_wait is None:
+            _worker()
+            return
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + max_wait
+        while worker.is_alive() and time.monotonic() < deadline:
+            worker.join(0.5)  # короткими ожиданиями: так повторный Ctrl+C срабатывает сразу (Windows)
+        if worker.is_alive():
+            print(f"[SYSTEM] Сервер не ответил за {max_wait:.0f} с — выхожу без извлечения фактов.")
         return
 
     def _deferred():
@@ -201,14 +213,14 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
     threading.Thread(target=_deferred, daemon=True).start()
 
 
-def inject_dynamic_context(user_input: str, memory_context: str = "", soul_patch: str = "") -> str:
+def inject_dynamic_context(user_input: str, memory_context: str = "", soul_patch: str = "", guest: bool = False) -> str:
     """
     Инжектит в пользовательский запрос динамическое состояние (время, железо,
     статус памяти, soul patch) и, опционально, найденный контекст из памяти.
     Всё изменчивое сюда, а не в системный промпт — см. комментарий над
     SYSTEM_PROMPT в prompt.py про стабильность KV-кэша llama.cpp.
     """
-    dynamic_state = get_dynamic_state(soul_patch=soul_patch)
+    dynamic_state = get_dynamic_state(soul_patch=soul_patch, **({"include_working_memory": False} if guest else {}))
     parts = [user_input]
 
     if memory_context:

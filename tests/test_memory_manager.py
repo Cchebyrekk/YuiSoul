@@ -2,7 +2,7 @@
 import pytest
 
 from conftest import write_facts
-from scripts.memory.manager import parse_fact_line, _strip_confidence_tag
+from scripts.memory.manager import parse_fact_line, parse_fact_lines, _strip_confidence_tag
 
 
 # ---------- разбор строк ----------
@@ -17,6 +17,20 @@ from scripts.memory.manager import parse_fact_line, _strip_confidence_tag
 ])
 def test_parse_fact_line(line, expected):
     assert parse_fact_line(line) == expected
+
+
+@pytest.mark.parametrize("line, expected", [
+    # замерено: опровержение с повтором пути и без скобки сохранялось мусорным фактом «(c=-1 [user/profile] ...»
+    ("[user/profile] (c=-1 [user/profile] Зовут Вадим.", [("user/profile", -1.0, "Зовут Вадим.")]),
+    ("[user/pets] (c=-1 Собаки нет.", [("user/pets", -1.0, "Собаки нет.")]),
+    ("[user/interests] Хочет сделать шлем на 3D-принтере. [user/interests] Интересуется измерением головы.",
+     [("user/interests", 0.0, "Хочет сделать шлем на 3D-принтере."),
+      ("user/interests", 0.0, "Интересуется измерением головы.")]),
+    ("[user/pets] Кот рыжий [вроде бы].", [("user/pets", 0.0, "Кот рыжий [вроде бы].")]),   # [слово] — не путь
+    ("просто текст", []),
+])
+def test_parse_fact_lines_tolerates_model_mistakes(line, expected):
+    assert parse_fact_lines(line) == expected
 
 
 def test_strip_confidence_tag():
@@ -147,9 +161,16 @@ def test_bm25_index_is_cached_until_memory_changes(mm):
     assert mm._bm25_cache is not cached
 
 
-def test_auto_context_returns_clean_matching_lines(mm):
+def low_thresholds(monkeypatch, value):
+    """Заглушка эмбеддингов грубее e5: пороги релевантности опускаем, проверяем логику, а не калибровку."""
+    import scripts.memory.manager as manager_mod
+    for name in ("VECTOR_SEARCH_THRESHOLD", "VECTOR_SEARCH_TOPIC_THRESHOLD"):
+        monkeypatch.setattr(manager_mod, name, value)
+
+
+def test_auto_context_returns_clean_matching_lines(mm, monkeypatch):
     mm.save_fact("user/pets", "Кот пользователя рыжий Барсик", confidence=0.5)
-    mm.vector_engine.threshold = 0.3  # заглушка эмбеддингов грубее e5; проверяем очистку строк, а не порог
+    low_thresholds(monkeypatch, 0.3)
     context = mm.get_auto_context("какого цвета кот Барсик")
     assert context == "- Кот пользователя рыжий Барсик."
 
@@ -219,6 +240,25 @@ def test_stems_match_word_forms():
     assert not content_stems("фильм на вечер") & content_stems("слушает синтвейв по вечерам")
 
 
+def test_topics_only_for_personal_questions():
+    from scripts.memory.manager import query_topics
+    assert query_topics("В какую игру я сейчас играю?") == {"игры"}
+    assert query_topics("Что приготовить на обед?") == {"еда"}          # инфинитив — про говорящего
+    assert query_topics("Сколько живут кошки?") == set()               # общий вопрос
+    assert query_topics("Какая игра самая продаваемая?") == set()
+
+
+def test_topic_links_game_to_visual_novel():
+    from scripts.config import VECTOR_SEARCH_TOPIC_THRESHOLD, VECTOR_SEARCH_THRESHOLD
+    from scripts.memory.manager import content_stems, is_relevant, query_topics
+    q = "Во что я играю?"
+    fact = "Пользователь любит визуальную новеллу Z.A.T.O."
+    score = (VECTOR_SEARCH_TOPIC_THRESHOLD + VECTOR_SEARCH_THRESHOLD) / 2   # ниже обычного порога
+    assert is_relevant(content_stems(q), query_topics(q), score, fact)
+    assert not is_relevant(content_stems(q), set(), score, fact)           # без темы — не проходит
+    assert not is_relevant(content_stems(q), query_topics(q), VECTOR_SEARCH_TOPIC_THRESHOLD - 0.01, fact)
+
+
 def test_similar_but_different_facts_both_kept(mm, memory_dir):
     mm.save_fact("user/pets", "Кота пользователя зовут Барсик")
     mm.save_fact("user/pets", "Кота пользователя зовут Мурзик")
@@ -226,9 +266,9 @@ def test_similar_but_different_facts_both_kept(mm, memory_dir):
     assert "Барсик" in text and "Мурзик" in text
 
 
-def test_auto_context_adds_nothing_unrelated(mm):
+def test_auto_context_adds_nothing_unrelated(mm, monkeypatch):
     mm.save_fact("user/family", "Мама пользователя живёт в Казани")
-    mm.vector_engine.threshold = -1.0            # заглушка эмбеддингов: пропускаем всё мимо порога
+    low_thresholds(monkeypatch, -1.0)            # всё проходит по косинусу — решают общие слова
     assert mm.get_auto_context("привет как дела") == ""           # нет общих слов — ничего (раньше: последняя строка)
     assert "Казани" in mm.get_auto_context("где живёт мама")
 

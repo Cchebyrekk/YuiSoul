@@ -4,6 +4,7 @@
 Работает на CPU, минимальная задержка.
 Динамически определяет частоту дискретизации модели.
 """
+import io
 import os
 import tempfile
 import threading
@@ -19,7 +20,26 @@ from scripts.config import TTS_BUFFER, TTS_CHANNELS, SILERO_SAMPLE_RATE, TTS_SPE
 from scripts.utils.lang import text_language
 
 
+def encode_ogg_opus(audio: np.ndarray, sample_rate: int) -> bytes:
+    """float32 моно -> ogg/opus в памяти (PyAV — он уже стоит вместе с faster-whisper)."""
+    import av
+    buf = io.BytesIO()
+    with av.open(buf, "w", format="ogg") as out:
+        stream = out.add_stream("libopus", rate=sample_rate)
+        stream.layout = "mono"
+        frame = av.AudioFrame.from_ndarray(np.clip(audio, -1, 1).reshape(1, -1), format="flt", layout="mono")
+        frame.sample_rate = sample_rate
+        for packet in stream.encode(frame):
+            out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+    return buf.getvalue()
+
+
 class TTSManager:
+    # Silero вызывают и поток озвучки, и голосовые для Telegram — по очереди
+    _synth_lock = threading.Lock()
+
     def __init__(self, tts_active_event: threading.Event = None, speaker: str = TTS_SPEAKER_RU):
         """
         :param tts_active_event: событие, устанавливаемое во время воспроизведения.
@@ -112,6 +132,30 @@ class TTSManager:
             return
         self.audio_queue.put((cleaned, lang))
 
+    def _synthesize(self, text: str, lang: str) -> np.ndarray:
+        """
+        Синтез через Silero -> float32 numpy. sample_rate передаём ЯВНО — это и есть частота, на которой
+        Silero реально сгенерирует аудио; она обязана совпадать с частотой pygame.mixer (см. __init__).
+        Под блокировкой: модель вызывают и поток озвучки, и голосовые для Telegram из основного потока.
+        """
+        with self._synth_lock:
+            audio = self.models[lang].apply_tts(text, speaker=self.speakers[lang], sample_rate=self.sample_rate)
+        if hasattr(audio, 'cpu'):
+            audio = audio.cpu()
+        return audio.numpy().squeeze().astype(np.float32)
+
+    def synthesize_ogg(self, text: str) -> bytes | None:
+        """Голосовое для Telegram: ogg/opus (другие форматы Telegram не показывает как голосовое)."""
+        cleaned = re.sub(r'<[^>]+>', '', text or '').strip()
+        lang = text_language(cleaned)
+        if not cleaned or lang not in self.models:
+            return None
+        try:
+            return encode_ogg_opus(self._synthesize(cleaned, lang), self.sample_rate)
+        except Exception as e:
+            print(f"[TTS] Не удалось записать голосовое: {e}")
+            return None
+
     def _worker(self):
         while self._running:
             try:
@@ -120,19 +164,7 @@ class TTSManager:
                 continue
 
             try:
-                # Синтез через Silero. sample_rate передаём ЯВНО — это и есть
-                # частота, на которой Silero реально сгенерирует аудио, а не
-                # то, что "предполагает" плеер. Она обязана совпадать с той,
-                # на которой инициализирован pygame.mixer (см. __init__).
-                audio = self.models[lang].apply_tts(text, speaker=self.speakers[lang], sample_rate=self.sample_rate)
-                # Приводим к numpy (float32)
-                if hasattr(audio, 'cpu'):
-                    audio = audio.cpu()
-                audio_np = audio.numpy().squeeze()
-
-                # Убедимся, что аудио в диапазоне [-1,1] и в float32
-                if audio_np.dtype != np.float32:
-                    audio_np = audio_np.astype(np.float32)
+                audio_np = self._synthesize(text, lang)
 
                 # Сохраняем во временный WAV с частотой модели
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
