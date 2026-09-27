@@ -2,10 +2,12 @@
 import pytest
 
 import scripts.agent.prompt as prompt_mod
+import scripts.tools.hardware as hardware_mod
 from conftest import write_facts
 from scripts.agent.emotion import EmotionBridge
 from scripts.memory.soul import SoulManager
-from scripts.tools.registry import (PC_CONTROL_TOOL_NAMES, SPEAK_ALOUD_TOOL, TOOLS, build_registry, inner_tools)
+from scripts.tools.registry import (EXECUTOR_TOOL_NAMES, PC_CONTROL_TOOL_NAMES, SPEAK_ALOUD_TOOL, TOOLS, build_registry,
+                                    inner_tools)
 
 
 def names(tools):
@@ -14,7 +16,7 @@ def names(tools):
 
 def test_every_tool_schema_has_a_handler(mm):
     registry = build_registry(mm)
-    assert set(names(TOOLS)) == set(registry)
+    assert set(names(TOOLS)) - EXECUTOR_TOOL_NAMES == set(registry)   # озвучку и ask выполняет сам executor
     assert names(TOOLS)[-2:] == ["stay_silent", "task_complete"]
 
 
@@ -66,16 +68,26 @@ def test_soul_patch(memory_dir):
 
 
 def test_dynamic_state_and_static_prompt(memory_dir, monkeypatch):
-    monkeypatch.setattr(prompt_mod, "get_hardware_context", lambda: "GPU OK")
     write_facts(memory_dir, "user/pets", ["- Кот"])
     state = prompt_mod.get_dynamic_state(memory_base_dir=str(memory_dir), soul_patch="SOUL")
-    assert "GPU OK" in state and "Файлов в /memory: 1" in state and "SOUL" in state
+    assert "Файлов в /memory: 1" in state and "SOUL" in state
+    assert "GPU" not in state   # мгновенные показания — только по запросу, иначе Юи сохраняет их как факт
     assert prompt_mod.build_system_prompt() == prompt_mod.build_system_prompt()   # статичен ради KV-кэша
     assert "<inner_thought>" in prompt_mod.build_system_prompt()
 
 
-def test_hardware_context_without_nvidia_smi(monkeypatch):
+def test_hardware_status_without_nvidia_smi(monkeypatch):
     def missing(*args, **kwargs):
         raise FileNotFoundError("nvidia-smi")
-    monkeypatch.setattr(prompt_mod.subprocess, "run", missing)
-    assert prompt_mod.get_hardware_context() == "GPU: Данные недоступны"
+    monkeypatch.setattr(hardware_mod.subprocess, "run", missing)
+    assert hardware_mod.get_hardware_status() == "GPU: Данные недоступны"
+
+
+def test_hardware_status_parses_every_gpu(monkeypatch):
+    class Done:
+        returncode = 0
+        stdout = "64, 33, 11527, 12288\n40, 0, 100, 8192\n"
+    monkeypatch.setattr(hardware_mod.subprocess, "run", lambda *a, **kw: Done())
+    status = hardware_mod.get_hardware_status()
+    assert "GPU 0: 64°C | Load: 33% | VRAM: 11527/12288 MB" in status
+    assert "GPU 1: 40°C" in status and "не сохраняй" in status

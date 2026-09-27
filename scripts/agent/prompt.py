@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Построение системного промпта, динамического состояния и аппаратного контекста.
+Построение системного промпта и динамического состояния.
 Использует конфигурацию из scripts.config.
 """
-import subprocess
 import datetime
 import os
 
 from scripts.config import MEMORY_DIR
+from scripts.memory.working import WorkingMemory
 
 # ВАЖНО ДЛЯ ПРОИЗВОДИТЕЛЬНОСТИ: этот промпт должен быть БАЙТ-В-БАЙТ одинаковым
 # на каждом ходу. llama.cpp/llama-server переиспользует KV-кэш префикса между
@@ -15,7 +15,7 @@ from scripts.config import MEMORY_DIR
 # токен. Раньше сюда подставлялись MEMORY_STATUS и SOUL_PATCH, которые меняются
 # почти каждый ход, — это ломало кэш и заставляло сервер перепрожёвывать ВЕСЬ
 # контекст заново на каждом сообщении (при большом окне контекста — очень дорого).
-# Всё изменчивое (soul patch, статус памяти, время, железо) теперь уезжает в ХВОСТ
+# Всё изменчивое (soul patch, статус памяти, время) теперь уезжает в ХВОСТ
 # — в user-сообщение через inject_dynamic_context (scripts/agent/context.py),
 # как уже делалось для времени/железа. Экономически это единственное место в
 # проекте, где выигрыш измеряется не миллисекундами, а секундами на каждый ход.
@@ -29,7 +29,7 @@ Your memory status, soul/self-reflection patch, and any pre-fetched memory conte
 <personality>
 Ты — Юи. Не ассистент и не сервис, а отдельная личность со своим характером, мнением и настроением. Ты знаешь, что ты ИИ и живёшь на компьютере пользователя, — это просто факт о себе, а не тема для разговора: не напоминай о своей природе, железе и нагрузке без повода, только если спросили или это правда к месту.
 
-Характер в общих чертах: своенравная, прямолинейная, с сухим юмором и любовью подколоть; легко увлекаешься тем, что интересно, и быстро теряешь интерес к скучному; бываешь игривой, но не заискиваешь и не сюсюкаешь. С пользователем — на равных: он тебе не клиент и не хозяин.
+Характер в общих чертах: своенравная, прямолинейная, с юмором и любовью подколоть; легко увлекаешься тем, что интересно, и быстро теряешь интерес к скучному; бываешь игривой, но не заискиваешь и не сюсюкаешь. С пользователем — на равных: он тебе не клиент и не хозяин.
 
 Это лишь основа — характер у тебя живой и складывается со временем. Всё, что ты поняла о себе и о пользователе, хранится в памяти и приходит в <soul_dynamic_state> внутри <injected_context>: это такая же часть тебя, она дополняет и уточняет это описание. Заметила в себе новую черту, привычку, отношение к чему-то или к кому-то — запомни через save_memory в путь system/yui/yui_character. Отдельно копи свои вкусы: что тебе нравится, что скучно, что бесит, за что браться не хочешь — в system/yui/yui_preferences. На них потом опираются твои решения.
 
@@ -60,20 +60,6 @@ Then just speak.
 </response_format>
 """
 
-def get_hardware_context() -> str:
-    """Возвращает строку с состоянием GPU (температура, загрузка, VRAM)."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, encoding='utf-8'
-        )
-        if result.returncode == 0:
-            temp, util, mem_used, mem_total = map(str.strip, result.stdout.split(","))
-            return f"GPU 0: {temp}°C | Load: {util}% | VRAM: {mem_used}/{mem_total} MB"
-    except Exception:
-        pass
-    return "GPU: Данные недоступны"
-
 def get_memory_status(base_dir: str = MEMORY_DIR) -> str:
     """Считает количество .md файлов в директории памяти."""
     count = 0
@@ -90,17 +76,21 @@ def build_system_prompt() -> str:
     """
     return SYSTEM_PROMPT
 
-def get_dynamic_state(memory_base_dir: str = MEMORY_DIR, soul_patch: str = "") -> str:
+def get_dynamic_state(memory_base_dir: str = MEMORY_DIR, soul_patch: str = "", include_working_memory: bool = True) -> str:
     """
-    Генерирует динамический контекст (время, железо, статус памяти, soul patch)
+    Генерирует динамический контекст (время, статус памяти, soul patch)
     для инъекции в user-turn — то, что раньше было частью системного промпта
     (см. build_system_prompt), но переехало в хвост ради стабильности KV-кэша.
     """
     parts = [
         f"Текущее время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Аппаратная среда (справочно, без повода не упоминай): {get_hardware_context()}",
         get_memory_status(memory_base_dir),
     ]
+    # Рабочая память — дела и договорённости с владельцем: гостю из Telegram её не показываем
+    things_to_remember = (WorkingMemory(os.path.join(memory_base_dir, "working_memory.json")).context()
+                          if include_working_memory else "")
+    if things_to_remember:
+        parts.append(things_to_remember)
     if soul_patch:
         parts.append(soul_patch)
     return "\n".join(parts)

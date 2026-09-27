@@ -59,8 +59,10 @@ MAX_RETRIES = 3                    # повторные попытки при с
 MAX_CONTEXT_CHARS = 60000          # для сжатия
 CONTEXT_TAIL_RATIO = 0.25          # доля хвоста при сжатии
 
-# Таймауты (секунды)
-LLM_TIMEOUT = 120.0
+# Таймауты (секунды): соединение и ожидание очередного куска ответа. Первый кусок приходит только после
+# обработки всего промпта — на холодном кэше (длинная история) это минуты; при таймауте сервер всё равно
+# дорабатывает брошенный запрос (--parallel 1), и повторная попытка ждёт уже за ним.
+LLM_TIMEOUT = (10, 300)
 
 # Флаги
 ENABLE_AUTONOMY = True            # автономные мысли в фоне
@@ -98,6 +100,7 @@ THINK_ON_TASKS_ONLY = True
 # только после паузы в разговоре и обрываем, если пользователь заговорил, — иначе быстрая
 # реплика ждала бы его в очереди (замерено: 16 с до первого звука вместо ~3 с).
 FACT_EXTRACTION_IDLE_DELAY = 15
+FACT_SAVE_ON_EXIT_WAIT = 90         # сколько ждать извлечения фактов при выходе по Ctrl+C (до 1024 токенов)
 WILL_CHECK_MAX_TOKENS = 80
 WILL_CHECK_TEMPERATURE = 0.7
 
@@ -121,12 +124,47 @@ WEB_SEARCH_MAX_RESULTS = 5
 WEB_PAGE_MAX_CHARS = 6000          # сколько текста страницы отдавать модели (~2000 токенов)
 WEB_TIMEOUT = 15                   # секунд на поиск/загрузку страницы
 
+# ==================== TELEGRAM ====================
+
+# Бот для связи с Юи, когда ты не у компьютера: текст, голосовые, фото; Юи может написать первой
+# (send_telegram). Токен — от @BotFather; ID владельца — твой числовой Telegram ID (бот назовёт его
+# в консоли, если написать ему /start). Оба — в файле .env в корне проекта (он в .gitignore):
+#   YUI_TELEGRAM_TOKEN=123456:ABC...
+#   YUI_TELEGRAM_OWNER_ID=123456789
+# Сообщения от всех, кроме владельца, игнорируются.
+
+
+def _load_env_file(path):
+    """Строки KEY=VALUE из .env -> os.environ (уже заданные переменные окружения важнее)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep and key and not key.startswith("#"):
+                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+_load_env_file(os.path.join(BASE_DIR, ".env"))
+TELEGRAM_TOKEN = os.environ.get("YUI_TELEGRAM_TOKEN", "")
+TELEGRAM_OWNER_ID = int(os.environ.get("YUI_TELEGRAM_OWNER_ID", "0") or 0)
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN)
+TELEGRAM_POLL_TIMEOUT = 30         # long polling: сколько секунд сервер Telegram держит запрос getUpdates
+TELEGRAM_MAX_MESSAGE = 4000        # лимит Telegram — 4096 символов; длиннее — режем на части
+TELEGRAM_BATCH_WINDOW = 2.0        # сообщения подряд с паузой меньше этой (сек) — одна реплика (и альбом фото)
+# Другие люди, пишущие боту (не владелец): Юи отвечает им в отдельной переписке, без доступа к памяти о тебе,
+# твоей переписке и компьютеру. Выключить — False: тогда отвечает только владельцу.
+TELEGRAM_GUESTS_ENABLED = True
+TELEGRAM_GUEST_MAX_PER_HOUR = 30     # сообщений в час от одного гостя (дальше — игнор)
+TELEGRAM_NOTIFY_OWNER_ABOUT_GUESTS = True  # сообщать тебе, когда Юи пишет новый человек
+
 # ==================== RAG 2.0 / РЕФЛЕКСИЯ ====================
 
 ENABLE_REFLECTION = True              # фоновая консолидация памяти (ReflectionManager)
 REFLECTION_POLL_INTERVAL = 30          # как часто фоновый поток проверяет условия (сек)
-REFLECTION_IDLE_THRESHOLD = 300        # сколько секунд без обращений к Юи нужно для рефлексии
-REFLECTION_MIN_INTERVAL = 1200         # минимум секунд между циклами рефлексии (20 мин)
+REFLECTION_IDLE_THRESHOLD = 60
+REFLECTION_MIN_INTERVAL = 120
 REFLECTION_MAX_STEPS = 8              # шагов внутреннего хода рефлексии
 REFLECTION_MIN_FACTS = 5               # минимум фактов в памяти, чтобы рефлексия имела смысл
 REFLECTION_RECENT_FACTS_WINDOW = 20    # сколько последних фактов анализировать за цикл
@@ -136,8 +174,14 @@ REFLECTION_RECENT_FACTS_WINDOW = 20    # сколько последних фа�
 # YUI перечитывает один файл памяти, находит похожие через векторный поиск,
 # и просит LLM сжать/объединить/переписать дубли — как человек, который во
 # сне переупаковывает воспоминания за день.
-ENABLE_SLEEP_CONSOLIDATION = False
-SLEEP_CONSOLIDATION_EVERY_N_CYCLES = 3     # раз в N срабатываний фоновой рефлексии
+ENABLE_SLEEP_CONSOLIDATION = True
+# Сны (scripts/memory/dreams.py): раз в сутки — ночью или после долгой тишины — из свежих фактов и дневника
+# чувств снится сон, приятный или кошмар (зависит от того, что было в дневнике).
+ENABLE_DREAMS = True
+DREAM_NIGHT_HOURS = (0, 7)          # с какого по какой час считается ночь
+DREAM_MIN_IDLE = 300               # или: сколько секунд тишины, чтобы уснуть днём
+SLEEP_CONSOLIDATION_EVERY_N_CYCLES = 1
+    # раз в N срабатываний фоновой рефлексии
 SLEEP_CONSOLIDATION_RELATED_FILES = 3      # сколько похожих файлов подмешивать к цели
 SLEEP_CONSOLIDATION_RECENT_BIAS = 0.8      # шанс выбрать САМЫЙ свежий файл, а не случайный
 SLEEP_CONSOLIDATION_MAX_TOKENS = 1024
@@ -219,9 +263,12 @@ AUTO_CONTEXT_MAX_CHARS = 400
 VECTOR_DUPLICATE_THRESHOLD = 0.87
 DUPLICATE_WORD_OVERLAP = 0.5
 # Релевантность факта запросу: косинус >= VECTOR_SEARCH_STRONG_THRESHOLD (выше любого постороннего
-# запроса в замере) или >= VECTOR_SEARCH_THRESHOLD и общее значимое слово (с учётом окончаний).
+# запроса в замере) или >= VECTOR_SEARCH_THRESHOLD и общее значимое слово (с учётом окончаний),
+# или >= VECTOR_SEARCH_TOPIC_THRESHOLD и общая тема из словаря (игра ~ новелла, ужин ~ еда) —
+# e5 не знает, что Z.A.T.O. это игра («во что я играю?» -> 0.75 при посторонних до 0.80).
 VECTOR_SEARCH_THRESHOLD = 0.76
 VECTOR_SEARCH_STRONG_THRESHOLD = 0.81
+VECTOR_SEARCH_TOPIC_THRESHOLD = 0.72
 
 # ==================== ЭМОЦИОНАЛЬНЫЙ КАНАЛ ====================
 

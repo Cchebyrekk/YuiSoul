@@ -18,7 +18,9 @@ from scripts.config import (
     AUTO_CONTEXT_MAX_CHARS,
     VECTOR_DUPLICATE_THRESHOLD,
     DUPLICATE_WORD_OVERLAP,
+    VECTOR_SEARCH_THRESHOLD,
     VECTOR_SEARCH_STRONG_THRESHOLD,
+    VECTOR_SEARCH_TOPIC_THRESHOLD,
     FACT_CONFIDENCE_DROP_THRESHOLD,
     FACT_CONFIDENCE_ANCHOR_THRESHOLD,
 )
@@ -45,7 +47,10 @@ def _strip_confidence_tag(text: str) -> tuple:
     return conf, text[m.end():]
 
 
-_FACT_LINE_RE = re.compile(r'^\[(.*?)\]\s*(?:\(c=([+-]?[\d.]+)\)\s*)?(.*)')
+# Метка доверия — и в неряшливом виде, который пишет модель: «(c=-1» без скобки, «c = -1)», «(c= -0.5)»
+_FACT_LINE_RE = re.compile(r'^\[(.*?)\]\s*(?:\(?\s*c\s*=\s*([+-]?\d+(?:\.\d+)?)\s*\)?\s*)?(.*)')
+# Начало следующего факта посреди строки: «... шлем. [user/interests] Интересуется ...»
+_NEXT_FACT_RE = re.compile(r'\s+(?=\[[A-Za-z_]+(?:/[\w-]+)+\])')
 
 
 def parse_fact_line(line: str):
@@ -68,6 +73,31 @@ def parse_fact_line(line: str):
     if not path or not text:
         return None
     return path, confidence, text
+
+
+def parse_fact_lines(line: str) -> list:
+    """
+    Строка вывода модели -> [(path, confidence, text)]. Модель бывает неряшлива (замерено):
+    два факта в одной строке («... [user/interests] ...»), путь повторён после метки
+    («[user/profile] (c=-1 [user/profile] Зовут Вадим.») — раньше опровержение из-за этого
+    сохранялось как новый факт с мусором «(c=-1» в тексте, а не удаляло старый.
+    """
+    facts, pending = [], None  # pending: (путь, confidence) метки, оставшейся без текста
+    for part in _NEXT_FACT_RE.split(line.strip()):
+        match = _FACT_LINE_RE.match(part.strip())
+        if not match:
+            continue
+        path, text = match.group(1).strip(), match.group(3).strip()
+        confidence = float(match.group(2)) if match.group(2) else None
+        if not text:
+            pending = (path, confidence) if confidence is not None else pending
+            continue
+        if confidence is None and pending and pending[0] == path:
+            confidence = pending[1]
+        pending = None
+        if path:
+            facts.append((path, confidence if confidence is not None else 0.0, text))
+    return facts
 
 
 # ---------- Слова фактов: основы и «отличительные» слова ----------
@@ -162,9 +192,52 @@ def canonical_path(path: str) -> str:
     return path
 
 
-def is_relevant(query_stems: set, score: float, fact: str) -> bool:
-    """Факт подходит запросу: очень похожий по смыслу — или похожий и с общим значимым словом."""
-    return score >= VECTOR_SEARCH_STRONG_THRESHOLD or bool(query_stems & content_stems(fact))
+# Темы, которые e5 не связывает сама: «во что я играю?» не похоже на «любит визуальную новеллу Z.A.T.O.»,
+# «что заказать на ужин?» — на «любимая еда — пицца». Слова приводятся к основам через _stem.
+TOPIC_WORDS = {
+    "игры": "игра игры игру играть играю играет играешь поиграть сыграть игровой геймер гейм "
+            "новелла новеллы новеллу шутер рпг rpg квест приставка консоль геймпад steam стим",
+    "еда": "еда еду еды ест поесть съесть кушать ужин ужинать обед обедать завтрак перекус голодный "
+           "готовить приготовить рецепт блюдо кухня вкусно пицца суп",
+    "музыка": "музыка музыку музыки песня песни песню трек треки альбом плейлист слушать слушаю слушает "
+              "рок джаз рэп синтвейв",
+    "питомцы": "питомец питомцы питомца животное животные кот кота коты котик кошка кошку кошачью собака "
+               "собаку пёс хомяк попугай аквариум",
+}
+_TOPIC_STEMS = {topic: {_stem(w) for w in words.split()} for topic, words in TOPIC_WORDS.items()}
+
+
+def topics_of(stems: set) -> set:
+    """Темы, к которым относятся основы слов."""
+    return {topic for topic, topic_stems in _TOPIC_STEMS.items() if stems & topic_stems}
+
+
+# Вопрос о самих собеседниках, а не общий: «во что я играю?», «что тебе нравится?» —
+# или безличный инфинитив, который по-русски тоже про говорящего: «что поесть?», «во что поиграть?».
+# Без этого тема цепляла общие вопросы: «сколько живут кошки?» -> «кота зовут Барсик».
+_PERSONAL_WORDS = {'я', 'мне', 'меня', 'мной', 'мой', 'моя', 'мое', 'моё', 'мою', 'мои', 'моих', 'моим', 'моей',
+                   'моего', 'мы', 'нам', 'нас', 'наш', 'наша', 'наши', 'ты', 'тебе', 'тебя', 'тобой', 'твой',
+                   'твоя', 'твою', 'твои', 'твоих', 'твоей', 'твоего', 'i', 'me', 'my', 'we', 'our', 'you', 'your'}
+
+
+def query_topics(query: str) -> set:
+    """Темы запроса — только если он о собеседниках; для общих вопросов пусто."""
+    words = re.findall(r"[a-zа-яё]+", query.lower())
+    personal = any(w in _PERSONAL_WORDS or w.endswith(('ть', 'ться')) for w in words)
+    return topics_of({_stem(w) for w in words}) if personal else set()
+
+
+def is_relevant(query_stems: set, query_topic_set: set, score: float, fact: str) -> bool:
+    """
+    Факт подходит запросу: очень похожий по смыслу, или похожий и с общим значимым словом,
+    или чуть менее похожий, но на ту же тему (игры, еда...) — см. query_topics.
+    """
+    if score >= VECTOR_SEARCH_STRONG_THRESHOLD:
+        return True
+    fact_stems = content_stems(fact)
+    if score >= VECTOR_SEARCH_THRESHOLD and query_stems & fact_stems:
+        return True
+    return score >= VECTOR_SEARCH_TOPIC_THRESHOLD and bool(query_topic_set & topics_of(fact_stems))
 
 
 class MemoryManager:
@@ -410,6 +483,50 @@ class MemoryManager:
                     mutable.append((confidence, text))
         return anchors, mutable
 
+    def read_fact_records(self, path: str) -> list:
+        """Факты файла по порядку: [{"date": "YYYY-MM-DD HH:MM"|None, "confidence": float, "text": str}]."""
+        try:
+            validated = self._validate_path(path)
+        except ValueError:
+            return []
+        full_path = os.path.join(self.base_dir, f"{validated}.md")
+        if not os.path.exists(full_path):
+            return []
+        records = []
+        with open(full_path, "r", encoding="utf-8") as f:
+            for line in f:
+                clean = line.strip("- ").strip()
+                if not clean:
+                    continue
+                m = re.match(r'^\[(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})\]\s*', clean)
+                confidence, text = _strip_confidence_tag(clean[m.end():] if m else clean)
+                if text.strip():
+                    records.append({"date": m.group(1) if m else None, "confidence": confidence, "text": text.strip()})
+        return records
+
+    def write_fact_records(self, path: str, records: list) -> None:
+        """Переписывает файл фактами records (даты сохраняются, без даты — текущая) и обновляет индекс."""
+        try:
+            validated = self._validate_path(path)
+        except ValueError:
+            return
+        full_path = os.path.join(self.base_dir, f"{validated}.md")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = []
+        for r in records:
+            conf = r.get("confidence", 0.0)
+            conf_tag = f"(c={conf:+.2f}) " if conf != 0.0 else ""
+            lines.append(f"- [{r.get('date') or now}] {conf_tag}{r['text'].strip()}\n")
+        with self._file_lock:
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            content = "".join(lines).strip()
+            if content:
+                self.vector_engine.add_document(doc_id=validated, text=content)
+            else:
+                self.vector_engine.remove_document(validated)
+
     def rewrite_mutable_lines(self, path: str, new_mutable: list) -> None:
         """
         Заменяет ВСЮ изменяемую (не-anchor) часть файла памяти на new_mutable —
@@ -510,10 +627,10 @@ class MemoryManager:
             return "Файл не найден."
 
         # Векторный поиск по отдельным фактам: показываем только подошедшие факты
-        query_stems = content_stems(query)
+        query_stems, query_topic_set = content_stems(query), query_topics(query)
         output = []
-        for res in self.vector_engine.search(query, top_k=top_k * 3):
-            facts = [fact for score, fact in res.get("hits", []) if is_relevant(query_stems, score, fact)]
+        for res in self.vector_engine.search(query, top_k=top_k * 3, threshold=VECTOR_SEARCH_TOPIC_THRESHOLD):
+            facts = [fact for score, fact in res.get("hits", []) if is_relevant(query_stems, query_topic_set, score, fact)]
             if facts:
                 listed = "\n".join(f"- {f}" for f in facts[:5])
                 output.append(f"Файл: {res['id']} (Сходство: {res['score']:.2f})\n{listed}\n")
@@ -550,19 +667,21 @@ class MemoryManager:
 
     def get_auto_context(self, query: str, max_files: int = AUTO_CONTEXT_MAX_FILES,
                          max_lines: int = AUTO_CONTEXT_MAX_LINES_PER_FILE,
-                         max_chars: int = AUTO_CONTEXT_MAX_CHARS) -> str:
+                         max_chars: int = AUTO_CONTEXT_MAX_CHARS, allowed=None) -> str:
         """
         Факты из памяти, подходящие к реплике, — для автоматической инъекции в контекст каждого хода.
         Ничего не подошло — пустая строка: лучше ничего, чем случайный факт (раньше на любую реплику
         подмешивалась последняя строка найденного файла, и на «как дела?» Юи видела «мама живёт в Казани»).
         """
-        query_stems = content_stems(query)
+        query_stems, query_topic_set = content_stems(query), query_topics(query)
         context_lines, seen, total_len, files_used = [], set(), 0, 0
-        for res in self.vector_engine.search(query, top_k=max_files * 3):
+        for res in self.vector_engine.search(query, top_k=max_files * 3, threshold=VECTOR_SEARCH_TOPIC_THRESHOLD):
             taken = 0
             for score, fact in res.get("hits", []):
-                if taken >= max_lines or not is_relevant(query_stems, score, fact):
+                if taken >= max_lines or not is_relevant(query_stems, query_topic_set, score, fact):
                     continue
+                if allowed is not None and not allowed(res["id"], fact):
+                    continue  # гостю из Telegram — только его файл и черты Юи, не память о владельце
                 norm = re.sub(r'[^a-zа-яё0-9]', '', fact.lower())
                 if not norm or norm in seen:
                     continue
@@ -594,10 +713,11 @@ class MemoryManager:
    - СНАЧАЛА ищи подходящий файл в структуре памяти выше и пиши туда. Новый файл — только если
      подходящего правда нет. Не создавай синонимы существующих файлов (tastes при наличии preferences).
    - Всё о пользователе — его вкусы, интересы, привычки, люди вокруг, настроение — [user/...]:
-     [user/interests] Любит аксолотлей. [user/profile] Зовут Вадим. [user/family] Сестру зовут Лена.
+     [user/interests] <что любит>. [user/profile] <имя, если он его назвал>. [user/family] <кто из близких и как зовут>.
+     (Это ШАБЛОНЫ формата, а не факты: пиши только то, что правда было в истории.)
    - О тебе самой: черты характера -> [system/yui/yui_character], что нравится/не нравится -> [system/yui/yui_preferences].
    - О ПК, железе -> [system/pc/pc_...].
-   - Знания о мире, не о пользователе и не о тебе -> своя тема: [biology/axolotls] Аксолотли умеют регенерировать.
+   - Знания о мире, не о пользователе и не о тебе -> своя тема: [<тема>/<подтема>] <факт>.
 4. Один факт — одна строка. Не повторяй то, что уже есть в памяти другими словами.
 5. Если фактов нет, пиши только: NULL
 6. ОПРОВЕРЖЕНИЕ: если из истории ясно, что пользователь ИСПРАВИЛ тебя, и что-то,
@@ -607,6 +727,9 @@ class MemoryManager:
    Это УДАЛИТ противоречащую запись из памяти вместо того, чтобы обе версии лежали
    рядом. Используй ТОЛЬКО когда действительно есть прямое опровержение, не для
    обычных новых фактов (у обычных фактов метки быть не должно).
+7. ДНЕВНИК: последней строкой — что ТЫ почувствовала в этом разговоре, от первого лица, с причиной,
+   одно-два предложения: [diary/{datetime.date.today():%Y-%m-%d}] <чувство> — потому что <что произошло>.
+   Честно, без дежурной радости; разговор был пустой или ничего не задел — дневник не пиши.
 
 История:
 {hist_str}

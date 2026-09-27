@@ -79,6 +79,9 @@ class FakeResponse:
     def json(self):
         return {"choices": [{"message": {"content": self._content}}]}
 
+    def close(self):
+        self.closed = True
+
     def iter_lines(self):
         # Без явных строк стрима — тот же content одним SSE-чанком (для запросов со stream=True)
         for line in self._lines or (sse({"content": self._content}) if self._content else []):

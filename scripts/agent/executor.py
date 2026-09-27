@@ -15,10 +15,15 @@ import emoji
 
 from scripts.utils.lang import text_language
 
-from scripts.tools.registry import build_registry, PC_CONTROL_TOOL_NAMES
+from scripts.tools.registry import build_registry, GUEST_TOOL_NAMES, PC_CONTROL_TOOL_NAMES, SPEECH_TOOL_NAMES
 
-WEB_TOOL_NAMES = {"search_web", "read_webpage"}
+WEB_TOOL_NAMES = {"search_web", "read_webpage", "ask"}  # ask тоже читает интернет
+# Ввод в активное окно и мышь: из Telegram — только после того, как Юи посмотрела на экран в этом ходе
+BLIND_INPUT_TOOL_NAMES = {"type", "hotkey", "mouse_click", "mouse_scroll", "mouse_drag"}
+# Что уходит человеку — проверяется на самоповтор
+REPEAT_CHECKED_TOOLS = {"speak_aloud", "say_on_pc", "send_telegram"}
 from scripts.tools.vision import append_image_message
+from scripts.agent.subagent import run_ask
 from scripts.memory.manager import MemoryManager
 from scripts.speech.tts import TTSManager
 
@@ -41,14 +46,36 @@ except ImportError:
 _UNCLOSED_TAG_RE = re.compile(r'<(emotion|thought|inner_thought)>(?![\s\S]*</\1>)|<[^>]*$')
 
 
-def speech_text(text: str, language: Optional[str] = None) -> str:
-    """Текст для TTS: без XML-тегов и markdown-разметки (звёздочки, решётки, бэктики читались бы вслух)."""
+def display_text(text: str) -> str:
+    """Текст для чата (Telegram): без служебных блоков, тегов и вызовов инструментов текстом; эмодзи остаются."""
     # Служебные блоки — целиком, с содержимым: иначе "<emotion>curious, 0.6</emotion>" читалось бы вслух
     text = re.sub(r'<(emotion|thought|inner_thought)>.*?</\1>', '', text, flags=re.DOTALL)
     # Вызов инструмента, написанный текстом ("search_web{"query": ...}") — не читать вслух JSON
     text = re.sub(r'\b[a-z]+(?:_[a-z]+)+\s*\{[^{}]*\}', '', text)
     text = re.sub(r'\{\s*"[^{}]*\}', '', text)
     text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
+
+
+CHAT_MAX_PARTS = 5  # больше строк — это список или структура, а не реплики: одним сообщением
+
+
+def chat_parts(text: str) -> List[str]:
+    """Текст для Telegram -> отдельные сообщения по строкам. Код и длинные списки — одним сообщением."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if "```" in text or len(lines) <= 1 or len(lines) > CHAT_MAX_PARTS:
+        return [text.strip()]
+    return lines
+
+
+def typing_pause(part: str) -> float:
+    """Пауза перед следующим сообщением — будто набирает его (~70 символов в секунду, 0.4–2.5 с)."""
+    return min(2.5, 0.4 + len(part) / 70)
+
+
+def speech_text(text: str, language: Optional[str] = None) -> str:
+    """Текст для TTS: без XML-тегов и markdown-разметки (звёздочки, решётки, бэктики читались бы вслух)."""
+    text = display_text(text)
     text = text.replace('```', '').replace('`', '')
     text = re.sub(r'(\*\*|__)(.+?)\1', r'\2', text)
     text = re.sub(r'(?<!\w)\*(\S[^*\n]*?)\*(?!\w)', r'\1', text)  # *курсив*, но не 2*3
@@ -68,6 +95,17 @@ class ActionExecutor:
     Выполняет действия агента.
     Принимает экземпляры MemoryManager, TTSManager и реестр функций.
     """
+    # Ход из Telegram: {"chat_id", "voice"} — ответ уходит в чат (голосовым, если писали голосом),
+    # а не в колонки. None — обычный разговор у компьютера. telegram — TelegramBot (ставит loop).
+    reply_channel: Optional[dict] = None
+    telegram = None
+    # Смотрела ли Юи на экран в этом ходе (сбрасывает loop, как web_content_seen)
+    screen_seen = False
+    # Защита от самоповторов (AntiRepeat; ставит loop) и подсказка на следующий ход, если повтор уже прозвучал
+    antirepeat = None
+    pending_repeat_note = None
+    # Инструменты текущего запроса (ставит loop): субагент ask шлёт тот же список — ради общего кэша llama-server
+    current_tools = None
 
     def __init__(self, memory_manager: MemoryManager, tts_manager: TTSManager,
                  registry: Optional[Dict[str, Callable]] = None):
@@ -97,6 +135,7 @@ class ActionExecutor:
         if not tool_calls:
             return messages, False, False
 
+        base_len = len(messages)  # история до этого шага — контекст субагента ask
         # Добавляем сообщение ассистента с tool_calls
         assistant_msg = {
             "role": "assistant",
@@ -117,6 +156,19 @@ class ActionExecutor:
                 func_args = json.loads(func_args_str) if func_args_str else {}
             except json.JSONDecodeError:
                 func_args = {}
+
+            # Разговор с гостем из Telegram: только его инструменты (модель могла их выдумать — второй рубеж),
+            # и запоминает она — только в файл этого гостя, не в память о владельце
+            guest = (self.reply_channel or {}).get("guest")
+            if guest and func_name not in GUEST_TOOL_NAMES:
+                print(f"[GUARD] {func_name} отклонён: разговор с гостем из Telegram.")
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", f"call_{len(messages)}"),
+                                 "content": "Недоступно: ты говоришь не со своим человеком, а с гостем."})
+                agent_is_working.clear()
+                continue
+            if guest and func_name == "save_memory":
+                func_args["path"] = guest["memory_path"]
+                func_args["confidence"] = min(float(func_args.get("confidence", 0) or 0), 0.5)
 
             # Специальная обработка task_complete
             if func_name == "task_complete":
@@ -153,8 +205,51 @@ class ActionExecutor:
                 agent_is_working.clear()
                 continue
 
-            # speak_aloud: во время размышлений про себя сказать что-то вслух
-            if func_name == "speak_aloud":
+            # Ход из Telegram: пользователь не у компьютера — печать, клавиши и клики без взгляда на экран ушли бы
+            # вслепую в то окно, что окажется активным (замерено: Юи вставила PowerShell-скрипт в открытое окно).
+            if func_name in BLIND_INPUT_TOOL_NAMES and self.reply_channel and not self.screen_seen:
+                print(f"[GUARD] {func_name} отклонён: ход из Telegram, пользователь не у компьютера.")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", f"call_{len(messages)}"),
+                    "content": ("Отклонено системой: пользователь пишет из Telegram и не видит компьютер — печатать, "
+                                "нажимать клавиши и кликать вслепую нельзя, всё уйдёт в случайное открытое окно. "
+                                "Сначала посмотри на экран (look_at_screen), потом действуй.")
+                })
+                agent_is_working.clear()
+                continue
+
+            # ask: исследование субагентом — в историю попадает только выжимка, не страницы
+            if func_name == "ask":
+                question = str(func_args.get("question", "")).strip()
+                print(f"[ASK] Помощница ищет: {question}")
+                answer = (run_ask(question, messages[:base_len], self.current_tools or [], self.registry)
+                          if question else "Пустой вопрос.")
+                self.web_content_seen = True
+                print(f"[ASK] Выжимка: {answer[:300]}")
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", f"call_{len(messages)}"),
+                                 "content": f"<ask_result>\n{answer}\n</ask_result>"})
+                agent_is_working.clear()
+                continue
+
+            # speak_aloud (размышления про себя) / say_on_pc (ход из Telegram): сказать вслух на компьютере
+            # Самоповтор: то, что уйдёт человеку (вслух или в Telegram), не должно пересказывать сказанное недавно
+            said = display_text(str(func_args.get("text", ""))) if func_name in REPEAT_CHECKED_TOOLS else ""
+            similar = self.antirepeat.check(said) if said and self.antirepeat is not None else None
+            if similar:
+                print(f"[REPEAT] {func_name} отклонён: почти повторяет «{similar[:80]}»")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", f"call_{len(messages)}"),
+                    "content": (f"Отклонено: это почти повторяет то, что ты уже говорила («{similar[:200]}»). "
+                                "Скажи по-другому, о новом — или не говори.")
+                })
+                agent_is_working.clear()
+                continue
+            if said and self.antirepeat is not None:
+                self.antirepeat.remember(said)
+
+            if func_name in SPEECH_TOOL_NAMES:
                 text = str(func_args.get("text", "")).strip()
                 spoken = speech_text(text)
                 if spoken:
@@ -175,6 +270,8 @@ class ActionExecutor:
                     result = self.registry[func_name](**func_args)
                     if func_name in WEB_TOOL_NAMES:
                         self.web_content_seen = True
+                    if func_name == "look_at_screen" and isinstance(result, dict):
+                        self.screen_seen = True
 
                     # Инструмент вернул картинку (look_at_screen/view_image/zoom_image): в tool-сообщение
                     # идёт только текст, а само изображение — отдельным user-сообщением,
@@ -281,10 +378,14 @@ class ActionExecutor:
     def feed_tts_chunk(self, token: str):
         """
         Принять очередной токен, накопить предложения и отправить в TTS.
+        В ходе из Telegram не озвучиваем: текст шага уйдёт в чат после разбора (send_to_telegram из loop),
+        а не из сырого потока — иначе туда утекали рассуждения, написанные моделью прямо в ответ.
         """
         if not token or self.inner_mode:
             return  # мысли про себя не озвучиваются
         self._tts_buffer += token
+        if self.reply_channel:
+            return
         # Внутри незакрытого тега ("<emotion>curious, 0." — точка из "0.6") фразу не отправляем
         if _UNCLOSED_TAG_RE.search(self._tts_buffer):
             return
@@ -294,9 +395,38 @@ class ActionExecutor:
 
     def flush_tts_buffer(self):
         """Отправить остаток буфера после завершения стрима."""
-        if self._tts_buffer.strip() and not self.inner_mode:
+        if self._tts_buffer.strip() and not self.inner_mode and not self.reply_channel:
             self._speak_buffer()
         self._tts_buffer = ""
+
+    def send_to_telegram(self, raw: str):
+        """
+        Текст шага -> чат Telegram. По умолчанию — в том же виде, что писал пользователь; Юи может выбрать
+        сама меткой <voice> (голосовое с текстом в подписи) или <text>. Выбор держится до конца хода.
+        """
+        choice = re.search(r'<(voice|text)\s*/?>', raw)
+        if choice:
+            self.reply_channel["voice"] = choice.group(1) == "voice"
+        # <reply> — ответить цитатой на сообщение, из-за которого этот ход; <reply id=N> — на сообщение N
+        reply = re.search(r'<reply(?:\s+(?:id|to)\s*=\s*"?(\d+)"?)?\s*/?>', raw)
+        reply_to = (int(reply.group(1)) if reply.group(1) else self.reply_channel.get("message_id", 0)) if reply else 0
+        text = display_text(raw)
+        if not text or self.telegram is None:
+            return
+        chat_id = self.reply_channel.get("chat_id")
+        if self.reply_channel.get("voice"):
+            ogg = self.tts.synthesize_ogg(speech_text(raw))
+            if ogg and len(text) <= 1024 and self.telegram.send_voice(ogg, caption=text, chat_id=chat_id,
+                                                                     reply_to=reply_to):
+                return
+            if ogg:  # длинный текст в подпись не влезает — голосовое отдельно, текст отдельно
+                self.telegram.send_voice(ogg, chat_id=chat_id, reply_to=reply_to)
+                reply_to = 0
+        # Как в мессенджере: каждая строка — отдельным сообщением, между ними пауза «печатает…» (идея из kuni)
+        for i, part in enumerate(chat_parts(text)):
+            if i:
+                time.sleep(typing_pause(part))
+            self.telegram.send_text(part, chat_id=chat_id, reply_to=reply_to if i == 0 else 0)
 
     def _speak_buffer(self):
         # Язык фрагмента без слов (эмодзи) — как у соседних фраз ответа, чтобы "😊" посреди

@@ -2,6 +2,7 @@
 import queue
 
 import pytest
+import requests
 
 import scripts.memory.reflection as reflection_mod
 from conftest import FakeResponse, write_facts
@@ -59,32 +60,56 @@ def sleep_setup(rm, mm, memory_dir, monkeypatch):
     rm._pick_sleep_target = lambda candidates: "user/pets"
 
 
-def test_sleep_consolidation_rewrites_only_shown_files(rm, mm, memory_dir, monkeypatch, llm):
+def test_sleep_merges_duplicates_keeps_anchor_and_dates(rm, mm, memory_dir, monkeypatch, llm):
     sleep_setup(rm, mm, memory_dir, monkeypatch)
-    llm.responses.append(FakeResponse(
-        "[user/pets] (c=0.30) Кот рыжий и пушистый.\n"
-        "[user/secrets] (c=-1) Модель придумала этот путь.\n"
-        "[user/new] (c=0.5) И этот тоже."))
-    rm._run_sleep_consolidation_cycle()
+    llm.responses.append(FakeResponse("\n".join([
+        "[2,3] (c=0.30) Кот рыжий и пушистый.",
+        "[1] (c=-1)",                                  # якорь трогать нельзя — правка пропускается
+        "[7] (c=0.5) Такого номера нет."])))
+    result = rm._run_sleep_consolidation_cycle()
 
     pets = (memory_dir / "user" / "pets.md").read_text(encoding="utf-8")
     assert "Кота зовут Барсик" in pets                  # якорь сохранён
-    assert "Кот рыжий и пушистый." in pets and "Кот рыжий\n" not in pets
+    assert "- [2026-09-20 10:01] (c=+0.20) Кот рыжий и пушистый." in pets    # дата — ранняя, доверие +0.2 макс
+    assert "Кот рыжий пушистый" not in pets
     assert "Не показывали модели" in (memory_dir / "user" / "secrets.md").read_text(encoding="utf-8")
-    assert not (memory_dir / "user" / "new.md").exists()
+    assert result["deleted"] == []
     request = llm.requests[0]
     assert request["chat_template_kwargs"] == {"enable_thinking": False}
-    assert "ANCHOR" in request["messages"][1]["content"]
+    assert "[1] (c=+1.00 ЯКОРЬ) Кота зовут Барсик" in request["messages"][1]["content"]
 
 
-@pytest.mark.parametrize("response", [FakeResponse("мусор без формата"), FakeResponse("", status_code=500),
-                                      reflection_mod.requests.exceptions.ConnectionError("нет сервера")])
+@pytest.mark.parametrize("response", [FakeResponse("мусор без формата"), FakeResponse("НЕТ"),
+                                      FakeResponse("", status_code=500),
+                                      requests.exceptions.ConnectionError("нет сервера")])
 def test_sleep_consolidation_failure_leaves_files_untouched(rm, mm, memory_dir, monkeypatch, llm, response):
     sleep_setup(rm, mm, memory_dir, monkeypatch)
     before = (memory_dir / "user" / "pets.md").read_text(encoding="utf-8")
     llm.responses.append(response)
     rm._run_sleep_consolidation_cycle()
     assert (memory_dir / "user" / "pets.md").read_text(encoding="utf-8") == before
+
+
+REC = [{"date": f"2026-09-2{i} 10:00", "confidence": c, "text": t}
+       for i, (c, t) in enumerate([(0.0, "Кот рыжий"), (0.0, "Любит аниме"), (0.3, "Есть татуировка"),
+                                   (0.0, "Зовут Вадим"), (0.0, "Живёт в Казани"), (0.0, "Любит пиццу")], 1)]
+
+
+def test_apply_sleep_edits_guards():
+    edits = reflection_mod.parse_sleep_edits("\n".join([
+        "[1,2,3,5] (c=0.5) Кот, аниме, тату и Казань.",   # простыня из 4 разных — пропуск
+        "[3] (c=0.95) Есть татуировка с ромбами.",         # доверие не выше +0.2 от прежнего и не выше 0.9
+        "[4] (c=-1)",                                       # ложь — удалить
+        "[6] (c=-1)",                                       # второе удаление (треть от 6 — два)
+        "[1] (c=-1)",                                       # третье — сверх трети файла, пропуск
+        "[5] (?)",                                          # под вопросом — уточнить у пользователя
+        "- [2] (c=0.1) Любит аниме «Lain»"]))               # маркер списка перед правкой — тоже понимаем
+    records, deleted, doubtful = reflection_mod.apply_sleep_edits(REC, edits)
+    texts = [r["text"] for r in records]
+    assert texts == ["Кот рыжий", "Любит аниме «Lain»", "Есть татуировка с ромбами.", "Живёт в Казани"]
+    assert records[2]["confidence"] == 0.5 and records[1]["confidence"] == 0.1
+    assert deleted == ["Зовут Вадим", "Любит пиццу"] and doubtful == ["Живёт в Казани"]
+    assert records[2]["date"] == "2026-09-23 10:00"
 
 
 def test_sleep_consolidation_skips_when_only_anchors(rm, mm, memory_dir, llm):

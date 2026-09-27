@@ -17,12 +17,13 @@ DuckDuckGo via ddgs         search_web (region ru-ru, 5 results, 15 s timeout)
 arbitrary URLs              read_webpage (trafilatura, <= 6000 chars)
 models.silero.ai            one-time Silero v3_1_ru download -> speech/silero_model.pt
 HuggingFace                 intfloat/multilingual-e5-base (first run)
+api.telegram.org            Telegram Bot API (long polling, own requests.Session; token + owner ID from .env)
 ```
 
 ## Python libraries (requirements.txt)
 ```
 LLM/HTTP     requests
-Speech       faster-whisper (STT, small, cpu int8), sounddevice, numpy
+Speech       faster-whisper (STT, small, cpu int8), sounddevice, numpy; av (bundled with faster-whisper) encodes Telegram voice replies to ogg/opus
              torch + soundfile (Silero TTS, 48 kHz), pygame (playback), emoji (demojize ru)
 Memory       sentence-transformers, rank-bm25
 OS control   keyboard, pyperclip

@@ -9,29 +9,45 @@ from datetime import datetime
 
 from scripts.config import SESSION_FILE
 from scripts.tools.vision import strip_images
+from scripts.agent.parser import sanitize_tool_calls
 
-def save_session(messages: list):
-    """Сохраняет историю сообщений в файл сессии."""
+
+def sanitize_history(messages: list) -> list:
+    """Испорченные вызовы инструментов в истории -> безопасные (см. sanitize_tool_calls): иначе сервер отвечает 500."""
+    for msg in messages:
+        if msg.get("tool_calls"):
+            msg["tool_calls"] = sanitize_tool_calls(msg["tool_calls"])
+    return messages
+
+def guest_session_file(user_id: int) -> str:
+    """Отдельная история для каждого гостя из Telegram — никогда не смешивается с историей владельца."""
+    return os.path.join(os.path.dirname(SESSION_FILE), f"tg_{int(user_id)}.json")
+
+
+def save_session(messages: list, path: str = None):
+    """Сохраняет историю сообщений в файл сессии (по умолчанию — владельца, SESSION_FILE)."""
+    path = path or SESSION_FILE
     try:
-        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     except FileExistsError:
         pass
     data = {
         "saved_at": datetime.now().isoformat(),
         # base64-картинки в файл сессии не пишем
-        "messages": strip_images(copy.deepcopy(messages))
+        "messages": sanitize_history(strip_images(copy.deepcopy(messages)))
     }
-    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def load_session() -> list | None:
+def load_session(path: str = None) -> list | None:
     """Загружает историю сообщений из файла сессии. Возвращает список сообщений или None."""
-    if not os.path.exists(SESSION_FILE):
+    path = path or SESSION_FILE
+    if not os.path.exists(path):
         return None
     try:
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        messages = data.get("messages", [])
+        messages = sanitize_history(data.get("messages", []))
         saved_time = data.get("saved_at", "неизвестно")
         # Добавляем системное сообщение о восстановлении
         wake_up_msg = {

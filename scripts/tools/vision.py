@@ -53,6 +53,10 @@ class VisionState:
         self.source: Optional[Image.Image] = None
         self.label = ""
         self.view: Box = (0, 0, 0, 0)
+        # Для скриншота — как пиксели картинки ложатся на рабочий стол (для мыши):
+        # (сдвиг кадра в общем скриншоте x, y, левый/верхний край рабочего стола, масштаб x, y).
+        # None — последняя картинка не экран (файл с диска).
+        self.screen: Optional[Tuple[int, int, int, int, float, float]] = None
 
     # --- открытие изображения ---
 
@@ -64,14 +68,17 @@ class VisionState:
         full = ImageGrab.grab(all_screens=True)
         monitors = list_monitors(full.size)
         legend = describe_monitors(monitors)
+        left, top, sx, sy = desktop_mapping(full.size)
         if not monitor or len(monitors) <= 1:
             # Общий кадр из нескольких мониторов длинный (3 x 1920 = 5760 px): при обычном пределе
             # 1280 px каждый монитор сжался бы до ~430 px — ничего не прочитать.
             max_side = SCREENSHOT_MAX_SIDE_ALL if len(monitors) > 1 else SCREENSHOT_MAX_SIDE
-            result = self._set_source(full, "все мониторы" if len(monitors) > 1 else "экран", max_side=max_side)
+            result = self._set_source(full, "все мониторы" if len(monitors) > 1 else "экран", max_side=max_side,
+                                      screen=(0, 0, left, top, sx, sy))
         elif 1 <= monitor <= len(monitors):
             m = monitors[monitor - 1]
-            result = self._set_source(full.crop(m["box"]), f"монитор {monitor}")
+            result = self._set_source(full.crop(m["box"]), f"монитор {monitor}",
+                                      screen=(m["box"][0], m["box"][1], left, top, sx, sy))
         else:
             return f"Ошибка: монитора {monitor} нет. {legend}"
         if len(monitors) > 1:
@@ -92,10 +99,11 @@ class VisionState:
             return f"Ошибка: не удалось открыть картинку: {e}"
         return self._set_source(loaded, os.path.basename(path))
 
-    def _set_source(self, img: Image.Image, label: str, max_side: int = 0) -> Dict[str, Any]:
+    def _set_source(self, img: Image.Image, label: str, max_side: int = 0, screen=None) -> Dict[str, Any]:
         with self._lock:
             self.source = img.convert("RGB")
             self.label = label
+            self.screen = screen
             self.view = (0, 0, *self.source.size)
             w, h = self.source.size
             data_url, sent = self._render(self.view, max_side=max_side)
@@ -141,6 +149,20 @@ class VisionState:
                         f"относительно ЭТОГО приближения; from_full=true — относительно всего изображения."),
         }
 
+    def screen_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """
+        Точка (x, y) в 0-1000 относительно того, что модель видит сейчас (скриншот или его
+        приближение), -> координаты рабочего стола для мыши. None — последняя картинка не экран.
+        """
+        with self._lock:
+            if self.source is None or self.screen is None:
+                return None
+            vx0, vy0, vx1, vy1 = self.view
+            px = vx0 + max(0.0, min(1000.0, float(x))) / 1000 * (vx1 - vx0)
+            py = vy0 + max(0.0, min(1000.0, float(y))) / 1000 * (vy1 - vy0)
+            ox, oy, left, top, sx, sy = self.screen
+            return round(left + (px + ox) / sx), round(top + (py + oy) / sy)
+
     def _ensure_min_size(self, box: List[int]) -> List[int]:
         """Растягивает слишком маленький кроп до MIN_CROP_SIDE вокруг центра, не выходя за границы."""
         w, h = self.source.size
@@ -183,6 +205,32 @@ def _monitor_rects() -> List[Tuple[int, int, int, int, bool]]:
     proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
     ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(callback), 0)
     return rects
+
+
+def desktop_mapping(image_size: Tuple[int, int]) -> Tuple[int, int, float, float]:
+    """(левый край, верхний край рабочего стола, масштаб x, y): пиксель общего скриншота -> координата мыши."""
+    try:
+        rects = _monitor_rects()
+    except Exception:
+        rects = []
+    if not rects:
+        return 0, 0, 1.0, 1.0
+    left, top = min(r[0] for r in rects), min(r[1] for r in rects)
+    width, height = max(r[2] for r in rects) - left, max(r[3] for r in rects) - top
+    return left, top, image_size[0] / width, image_size[1] / height
+
+
+def capture_screen_jpeg(monitor: int = 0, quality: int = 90) -> Tuple[Optional[bytes], str]:
+    """Скриншот в JPEG в полном разрешении (для отправки в Telegram): (байты, подпись) или (None, ошибка)."""
+    full = ImageGrab.grab(all_screens=True)
+    monitors = list_monitors(full.size)
+    if monitor and len(monitors) > 1:
+        if not 1 <= monitor <= len(monitors):
+            return None, f"Ошибка: монитора {monitor} нет. {describe_monitors(monitors)}"
+        full = full.crop(monitors[monitor - 1]["box"])
+    buf = io.BytesIO()
+    full.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue(), f"монитор {monitor}" if monitor and len(monitors) > 1 else "экран"
 
 
 def list_monitors(image_size: Tuple[int, int]) -> List[Dict[str, Any]]:

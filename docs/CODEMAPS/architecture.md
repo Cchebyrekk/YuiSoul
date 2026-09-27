@@ -10,6 +10,10 @@ LLM: external `llama-server` (OpenAI-compatible, `127.0.0.1:8080`, `--parallel 1
 main          input_queue.get() -> run_agent_loop()
 keyboard      input() -> input_queue ("text")
 STTManager    mic -> faster-whisper -> input_queue ("voice", interrupted=agent_busy)
+TelegramBot   long polling getUpdates (owner only) -> input_queue ("telegram", {chat_id, kind, images, sent_at, message_id});
+              callback_query -> approval buttons; stickers -> image + sticker_id
+ReminderWatcher every 30 s: working_memory remind_at due -> input_queue ("reminder", prompt) -> inner turn
+              voice -> STTManager.transcribe_bytes; photo -> data URL (vision)
 TTSManager    speak queue -> Silero -> pygame
 Autonomy      no talk with YUI >= 180 s, every >= 600 s -> input_queue ("autonomy", prompt)
 Reflection    no talk >= 300 s, every >= 1200 s -> input_queue ("reflection", facts prompt); sleep consolidation in-thread

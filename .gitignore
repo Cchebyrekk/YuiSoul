@@ -21,5 +21,8 @@ htmlcov/
 # Runtime data
 sessions/
 debug_logs/
-memory/
-memory_backup_*/
+/memory/
+/memory_backup_*/
+
+# Secrets (Telegram token etc.)
+.env

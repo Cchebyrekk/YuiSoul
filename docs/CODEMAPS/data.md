@@ -28,8 +28,14 @@ save_fact(path, content, conf)
   -> dedupe: search_lines cosine >= 0.87 AND same_fact (word-stem overlap >= 0.5, same names/numbers/latin)
      other file -> ACK (skip); same file -> replace line
   -> append line to .md -> VectorSearchEngine.add_document
-relevance: cosine >= 0.81, or >= 0.76 + shared stem (is_relevant); tuned by evals/retrieval_eval.py
+relevance: cosine >= 0.81, or >= 0.76 + shared stem, or >= 0.72 + shared topic (TOPIC_WORDS: games/food/music/pets;
+           only for questions about the speakers — query_topics) — is_relevant; tuned by evals/retrieval_eval.py
 search_facts(query) = relevant facts per file (vector) -> BM25 fallback; recency boost for ranking
+sleep (reflection.py, ENABLE_SLEEP_CONSOLIDATION): one file, numbered edits [N]/[N,M]/(c=-1)/(?), unmentioned kept,
+      conf +-0.2 max 0.9, <=1/3 deleted, dates kept, diary/ and reflections/ excluded; (?) -> memory/to_verify.json
+verify.py: user answer -> c=1 anchor | delete; diary/YYYY-MM-DD.md: feelings (from fact extraction, rule 7)
+dreams.py: diary/dreams.md once a day (night 0-7 or idle >= 1h); NOT indexed; soul shows <recent_feelings>, <last_dream>
+people/tg_<id>.md: facts about Telegram guests; guest context = own file + system/yui facts without owner mentions
 get_auto_context(query) -> <= 3 files x 2 lines, <= 400 chars -> injected_context
 extract_and_save_facts(history)  LLM extracts facts -> save_fact
   called: end of turn (loop.py:312-352) and on compress_context (dropped msgs, bg)

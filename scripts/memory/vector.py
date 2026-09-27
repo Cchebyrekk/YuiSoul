@@ -172,23 +172,24 @@ class VectorSearchEngine:
         return [{"id": lines[i]["id"], "line": lines[i]["text"], "score": float(scores[i])}
                 for i in order if scores[i] > threshold]
 
-    def search(self, query: str, top_k: int = 3) -> list:
+    def search(self, query: str, top_k: int = 3, threshold: float = None) -> list:
         """
         Ищет top_k наиболее подходящих документов (файлов).
         Возвращает [{"id", "text", "score", "lines"}]: score — лучший косинус среди фактов
         файла, lines — факты файла, прошедшие порог, по убыванию сходства.
 
-        Релевантность (порог self.threshold) решается ИСКЛЮЧИТЕЛЬНО по чистому косинусу
-        отдельного факта — свежесть не может протащить нерелевантный документ мимо фильтра.
-        Среди прошедших фильтр порядок взвешивается свежестью файла (updated_at).
+        Релевантность (порог threshold, по умолчанию self.threshold) решается ИСКЛЮЧИТЕЛЬНО по
+        чистому косинусу отдельного факта — свежесть не может протащить нерелевантный документ
+        мимо фильтра. Среди прошедших фильтр порядок взвешивается свежестью файла (updated_at).
         """
+        threshold = self.threshold if threshold is None else threshold
         scores, lines, docs = self._line_scores(query)
         if scores is None:
             return []
         by_doc = {}
         for idx in np.argsort(-scores):
             score = float(scores[idx])
-            if score <= self.threshold:
+            if score <= threshold:
                 break
             by_doc.setdefault(lines[idx]["id"], []).append((score, lines[idx]["text"]))
 
