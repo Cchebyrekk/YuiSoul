@@ -75,6 +75,23 @@ def parse_fact_line(line: str):
     return path, confidence, text
 
 
+_TOOL_MARKUP_RE = re.compile(r"</?(?:function|parameter|tool_call)\b")
+
+
+def clean_fact_text(content: str) -> str:
+    """
+    Текст факта без мусора: всё с первого тега вызова инструмента отрезается (замерено: модель дописала в заметку
+    следующий вызов текстом — «</function></tool_call><tool_call><function=save_memory>…» — и это легло в память
+    строками); голый путь без единого пробела («system/yui/memories») — не факт. Многострочное — в одну строку.
+    """
+    text = (content or "").strip()
+    markup = _TOOL_MARKUP_RE.search(text)
+    if markup:
+        text = text[:markup.start()]
+    text = " ".join(text.split())
+    return "" if "/" in text and " " not in text else text
+
+
 def parse_fact_lines(line: str) -> list:
     """
     Строка вывода модели -> [(path, confidence, text)]. Модель бывает неряшлива (замерено):
@@ -370,7 +387,9 @@ class MemoryManager:
         try:
             validated = self._validate_path(path)
             full_path = os.path.join(self.base_dir, f"{validated}.md")
-            new_fact = content.strip()
+            new_fact = clean_fact_text(content)
+            if not new_fact:
+                return "[MEMORY] Пусто: в тексте не было факта (только разметка вызова или путь)."
             is_retraction = confidence <= FACT_CONFIDENCE_DROP_THRESHOLD
 
             duplicates = []
@@ -667,11 +686,12 @@ class MemoryManager:
 
     def get_auto_context(self, query: str, max_files: int = AUTO_CONTEXT_MAX_FILES,
                          max_lines: int = AUTO_CONTEXT_MAX_LINES_PER_FILE,
-                         max_chars: int = AUTO_CONTEXT_MAX_CHARS, allowed=None) -> str:
+                         max_chars: int = AUTO_CONTEXT_MAX_CHARS, allowed=None, label=None) -> str:
         """
         Факты из памяти, подходящие к реплике, — для автоматической инъекции в контекст каждого хода.
         Ничего не подошло — пустая строка: лучше ничего, чем случайный факт (раньше на любую реплику
         подмешивалась последняя строка найденного файла, и на «как дела?» Юи видела «мама живёт в Казани»).
+        label(doc_id) -> подпись перед фактом (например, «[про Светлану, а не про твоего человека] »).
         """
         query_stems, query_topic_set = content_stems(query), query_topics(query)
         context_lines, seen, total_len, files_used = [], set(), 0, 0
@@ -685,7 +705,7 @@ class MemoryManager:
                 norm = re.sub(r'[^a-zа-яё0-9]', '', fact.lower())
                 if not norm or norm in seen:
                     continue
-                to_add = f"- {fact.rstrip('.')}."
+                to_add = f"- {label(res['id']) if label else ''}{fact.rstrip('.')}."
                 if total_len + len(to_add) > max_chars:
                     return "\n".join(context_lines)
                 seen.add(norm)

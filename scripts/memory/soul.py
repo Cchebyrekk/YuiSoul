@@ -13,6 +13,18 @@ from scripts.config import MEMORY_DIR
 _OWNER_MARKERS = re.compile(r"пользовател|хозя|\b(он|его|ему|им|ним|нём|него)\b|переписк|telegram|телеграм", re.IGNORECASE)
 
 
+# Сколько символов «души» уходит в каждое сообщение — настоящие лимиты, свежее важнее старого
+SOUL_USER_CHARS = 900      # что она знает о пользователе
+SOUL_SELF_CHARS = 1400     # её характер и вкусы (system/yui/yui_*.md)
+SOUL_NOTES_CHARS = 700     # последние заметки рефлексии
+SOUL_DREAM_CHARS = 500     # последний сон
+SOUL_LINE_MAX = 240        # длиннее — заметка-простыня, берём начало
+_STAMP_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]")
+_TOOL_MARKUP_RE = re.compile(r"</?(?:function|parameter|tool_call)\b")
+# «- [дата] (c=+0.90) [дата] (дата) текст» -> «текст»
+_PREFIX_RE = re.compile(r"^[-*]?\s*(?:\[[^\]]*\]\s*|\(c=[^)]*\)\s*|\(\d{4}-\d{2}-\d{2}[^)]*\)\s*)*")
+
+
 def guest_safe_fact(fact: str) -> bool:
     """Можно ли показать этот факт о Юи гостю: в нём нет ничего о владельце."""
     return not _OWNER_MARKERS.search(fact)
@@ -21,35 +33,40 @@ class SoulManager:
     def __init__(self, base_dir: str = MEMORY_DIR):
         self.base_dir = base_dir
 
-    def _read_dir_facts(self, sub_dir: str, max_chars: int = 500) -> str:
-        """Читает все .md файлы в подпапке с жестким лимитом символов."""
-        target_dir = os.path.join(self.base_dir, sub_dir)
-        if not os.path.exists(target_dir):
-            return ""
-        
-        facts = []
-        total_len = 0
-        
-        for root, _, files in os.walk(target_dir):
-            for file in files:
-                if not file.endswith(".md"):
+    def _newest_lines(self, pattern: str, max_chars: int) -> str:
+        """
+        Самые свежие строки фактов из файлов memory/<pattern> — не больше max_chars символов, по порядку времени,
+        без дат и меток доверия. Раньше лимит только прекращал читать СЛЕДУЮЩИЕ файлы, а первый брался целиком:
+        за три дня работы reflection_notes.md и yui_character.md выросли, «душа» стала 29 тыс. символов на
+        каждое сообщение (половина всего контекста), и разговор из истории вытеснялся — Юи «тупела» (замерено).
+        """
+        dated = []
+        for fpath in glob.glob(os.path.join(self.base_dir, *pattern.split("/")), recursive=True):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                fallback = datetime.datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                continue
+            when = None  # дата последней датированной строки файла: строка без даты — продолжение той же заметки
+            for line in lines:
+                stamp = _STAMP_RE.search(line)
+                when = stamp.group(1) if stamp else when
+                text = _PREFIX_RE.sub("", line).strip()
+                # Обрывки вызова инструмента, сохранённые как «факты» (замерено: <function=save_memory>,
+                # <parameter=path>, голый путь reflections/reflection_notes), — не её мысли, в душу не идут
+                if not text or _TOOL_MARKUP_RE.search(text) or ("/" in text and " " not in text):
                     continue
-                fpath = os.path.join(root, file)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                    if content:
-                        # Убираем маркеры списков для экономии токенов
-                        clean_content = content.replace("- ", "").replace("* ", "")
-                        facts.append(clean_content)
-                        total_len += len(clean_content)
-                        if total_len > max_chars:
-                            break
-                except Exception:
-                    continue
-            if total_len > max_chars:
+                dated.append((when or fallback, len(dated), text))
+        picked, total = [], 0
+        for _, _, text in sorted(dated, reverse=True):  # от свежих к старым, пока есть место
+            if len(text) > SOUL_LINE_MAX:
+                text = text[:SOUL_LINE_MAX].rstrip() + "…"
+            if total + len(text) > max_chars:
                 break
-        return "\n".join(facts).strip()
+            picked.append(text)
+            total += len(text) + 1
+        return "\n".join(reversed(picked))
 
     def _read_recent_diary(self, max_entries: int = 4, max_chars: int = 500) -> str:
         """Последние записи эмоционального дневника (memory/diary/ГГГГ-ММ-ДД.md), новые — в конце."""
@@ -87,36 +104,6 @@ class SoulManager:
         age = datetime.datetime.now() - datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
         return m.group(2) if age.total_seconds() <= max_age_hours * 3600 else ""
 
-    def _read_recent_reflections(self, max_files: int = 2, max_chars: int = 400) -> str:
-        """
-        Читает N последних заметок ReflectionManager из /memory/reflections/.
-        Имена файлов содержат сортируемую по времени метку
-        (reflection_YYYY-MM-DD_HH-MM.md), поэтому сортировки по имени достаточно.
-        Это и есть точка, где фоновая консолидация памяти (RAG 2.0) реально
-        влияет на поведение — иначе рефлексии просто лежат мёртвым грузом в файлах.
-        """
-        reflections_dir = os.path.join(self.base_dir, "reflections")
-        files = sorted(glob.glob(os.path.join(reflections_dir, "reflection_*.md")), reverse=True)
-
-        notes = []
-        total_len = 0
-        for fpath in files[:max_files]:
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                # Убираем markdown-заголовок "# Рефлексия от ..." — дата не нужна модели
-                content = "\n".join(
-                    line for line in content.split("\n") if not line.startswith("#")
-                ).strip().replace("- ", "")
-                if content:
-                    notes.append(content)
-                    total_len += len(content)
-                    if total_len > max_chars:
-                        break
-            except Exception:
-                continue
-        return "\n".join(notes).strip()
-
     def generate_guest_patch(self) -> str:
         """
         Душа для разговора с гостем из Telegram: только черты и предпочтения самой Юи — без профиля владельца,
@@ -139,45 +126,28 @@ class SoulManager:
         text = " ".join(lines)[:1000]
         return f"<self_reflection>\n{text}\n</self_reflection>" if text else ""
 
-    def generate_soul_patch(self) -> str:
+    def generate_soul_patch(self, include_notes: bool = True) -> str:
         """
         Анализирует структуру памяти и генерирует динамическую заплатку:
         - user_profile из /memory/user/
         - self_reflection из /memory/system/yui/ + последние заметки ReflectionManager
         """
-        # 1. Профиль пользователя
-        user_facts = self._read_dir_facts("user", max_chars=500)
+        # 1. Профиль пользователя (memory/user/, с подпапками) — самое свежее в пределах лимита
+        user_facts = self._newest_lines("user/**/*.md", SOUL_USER_CHARS)
 
         # 2. Саморефлексия YUI (только файлы system/yui/yui_*.md)
-        yui_facts = []
-        system_dir = os.path.join(self.base_dir, "system", "yui")
-        if os.path.exists(system_dir):
-            yui_len = 0
-            for file in os.listdir(system_dir):
-                if file.startswith("yui_") and file.endswith(".md"):
-                    fpath = os.path.join(system_dir, file)
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            content = f.read().strip().replace("- ", "")
-                        if content:
-                            yui_facts.append(content)
-                            yui_len += len(content)
-                            # Характер теперь растёт в основном через память, а не через промпт — лимит шире
-                            if yui_len > 1000:
-                                break
-                    except Exception:
-                        continue
+        yui_facts = self._newest_lines("system/yui/yui_*.md", SOUL_SELF_CHARS)
 
         # 3. Последние выводы фоновой рефлексии (RAG 2.0 консолидация)
-        recent_reflections = self._read_recent_reflections()
+        # Самой рефлексии её же заметки не показываем: она читала их и дописывала похожее — замкнутый круг
+        recent_reflections = (self._newest_lines("reflections/reflection_*.md", SOUL_NOTES_CHARS)
+                              if include_notes else "")
 
         patch_parts = []
         if user_facts:
             patch_parts.append(f"<user_profile>\n{user_facts}\n</user_profile>")
         if yui_facts or recent_reflections:
-            reflection_block = " ".join(yui_facts)
-            if recent_reflections:
-                reflection_block = f"{reflection_block}\n{recent_reflections}".strip()
+            reflection_block = f"{yui_facts}\n{recent_reflections}".strip()
             patch_parts.append(f"<self_reflection>\n{reflection_block}\n</self_reflection>")
 
         # 4. Эмоциональный дневник (идея из kuni): что она недавно чувствовала — и последний сон, если был недавно
@@ -185,6 +155,8 @@ class SoulManager:
         if feelings:
             patch_parts.append(f"<recent_feelings>\n{feelings}\n</recent_feelings>")
         dream = self._last_dream()
+        if len(dream) > SOUL_DREAM_CHARS:
+            dream = dream[:SOUL_DREAM_CHARS].rstrip() + "…"
         if dream:
             patch_parts.append(f"<last_dream>\n{dream}\n(Этот сон снился тебе недавно — можешь рассказать о нём, "
                                f"если захочется и будет к месту.)\n</last_dream>")

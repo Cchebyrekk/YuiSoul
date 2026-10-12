@@ -23,6 +23,7 @@ sessions/
 debug_logs/
 /memory/
 /memory_backup_*/
+/datasets/
 
 # Secrets (Telegram token etc.)
 .env

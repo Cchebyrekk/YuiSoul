@@ -106,6 +106,10 @@ class ActionExecutor:
     pending_repeat_note = None
     # Инструменты текущего запроса (ставит loop): субагент ask шлёт тот же список — ради общего кэша llama-server
     current_tools = None
+    # Напоминание: дошло ли что-то до человека в этом ходе (вслух или в Telegram), и как доставить текст,
+    # если модель написала напоминание текстом вместо инструмента (ставит loop: deliver(text))
+    delivered = False
+    deliver = None
 
     def __init__(self, memory_manager: MemoryManager, tts_manager: TTSManager,
                  registry: Optional[Dict[str, Callable]] = None):
@@ -134,6 +138,16 @@ class ActionExecutor:
         """
         if not tool_calls:
             return messages, False, False
+        try:
+            return self._execute_tool_calls(tool_calls, messages, agent_is_working)
+        finally:
+            # «Занята» снимается всегда: task_complete и stay_silent выходили из цикла, не сняв флаг, и после
+            # такого хода автономия и рефлексия всю ночь ждали, пока Юи «освободится» (замерено: за ночь —
+            # одна мысль и ни одной рефлексии)
+            agent_is_working.clear()
+
+    def _execute_tool_calls(self, tool_calls: List[Dict[str, Any]], messages: List[Dict[str, str]],
+                            agent_is_working: threading.Event) -> tuple:
 
         base_len = len(messages)  # история до этого шага — контекст субагента ask
         # Добавляем сообщение ассистента с tool_calls
@@ -234,8 +248,11 @@ class ActionExecutor:
 
             # speak_aloud (размышления про себя) / say_on_pc (ход из Telegram): сказать вслух на компьютере
             # Самоповтор: то, что уйдёт человеку (вслух или в Telegram), не должно пересказывать сказанное недавно
+            # Напоминание по сути повторяет обещанное («напомню про воду» -> «пора пить воду») — его не проверяем:
+            # иначе защита отклоняла само напоминание, и оно не доходило (замерено)
             said = display_text(str(func_args.get("text", ""))) if func_name in REPEAT_CHECKED_TOOLS else ""
-            similar = self.antirepeat.check(said) if said and self.antirepeat is not None else None
+            similar = (self.antirepeat.check(said) if said and self.antirepeat is not None
+                       and self.inner_mode != "reminder" else None)
             if similar:
                 print(f"[REPEAT] {func_name} отклонён: почти повторяет «{similar[:80]}»")
                 messages.append({
@@ -255,6 +272,7 @@ class ActionExecutor:
                 if spoken:
                     print(f"\n[YUI ВСЛУХ]: {spoken}")
                     self.tts.speak(spoken)
+                    self.delivered = True
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{len(messages)}"),
@@ -270,6 +288,8 @@ class ActionExecutor:
                     result = self.registry[func_name](**func_args)
                     if func_name in WEB_TOOL_NAMES:
                         self.web_content_seen = True
+                    if func_name == "send_telegram" and str(result).startswith(("Отправлено", "Скриншот", "Файл", "Картинка")):
+                        self.delivered = True
                     if func_name == "look_at_screen" and isinstance(result, dict):
                         self.screen_seen = True
 
@@ -354,7 +374,8 @@ class ActionExecutor:
         clean_output = speech_text(final_reply)
         if clean_output:
             label = f"[YUI ДУМАЕТ ({self.inner_mode})]" if self.inner_mode else "[YUI FINAL]"
-            print(f"\n{label}: {clean_output}")
+            print(f"\n{label}: {display_text(final_reply)}")  # в консоли эмодзи как есть, не «смеётся с закрытыми глазами»
+            self.delivered = self.delivered or not self.inner_mode
             # Эмоция: сначала доверяем самоотчёту модели (тег <emotion>),
             # и только если его не было — эвристике по ключевым словам.
             if self_reported_emotion:
@@ -364,6 +385,11 @@ class ActionExecutor:
             if emotion != "neutral":
                 self.emotion_bridge.send_emotion(emotion, intensity)
             agent_is_working.clear()  # после озвучивания
+        elif self.inner_mode and re.search(r'<inner_thought>\s*\S', final_reply):
+            # Во внутреннем ходе мысль про себя (<inner_thought>) — и есть ответ, а не сбой
+            thought = re.sub(r'</?inner_thought>', '', final_reply).strip()
+            print(f"\n[YUI ДУМАЕТ ({self.inner_mode})]: {thought}")
+            self.emotion_bridge.send_emotion("thinking", intensity=0.6)
         else:
             print("[SYSTEM] Агент выдал невалидный ответ (только мысли/код без текста).")
             # Всё равно отправляем эмоцию "thinking"
@@ -407,12 +433,11 @@ class ActionExecutor:
         choice = re.search(r'<(voice|text)\s*/?>', raw)
         if choice:
             self.reply_channel["voice"] = choice.group(1) == "voice"
-        # <reply> — ответить цитатой на сообщение, из-за которого этот ход; <reply id=N> — на сообщение N
-        reply = re.search(r'<reply(?:\s+(?:id|to)\s*=\s*"?(\d+)"?)?\s*/?>', raw)
-        reply_to = (int(reply.group(1)) if reply.group(1) else self.reply_channel.get("message_id", 0)) if reply else 0
+        raw, reply_to = self._reply_target(raw)
         text = display_text(raw)
         if not text or self.telegram is None:
             return
+        self.delivered = True
         chat_id = self.reply_channel.get("chat_id")
         if self.reply_channel.get("voice"):
             ogg = self.tts.synthesize_ogg(speech_text(raw))
@@ -427,6 +452,27 @@ class ActionExecutor:
             if i:
                 time.sleep(typing_pause(part))
             self.telegram.send_text(part, chat_id=chat_id, reply_to=reply_to if i == 0 else 0)
+
+    def _reply_target(self, raw: str) -> tuple:
+        """
+        Цитата в ответе: <reply> — на сообщение, из-за которого этот ход; <reply id=N> — на сообщение N;
+        <reply>текст старого сообщения</reply> — на то сообщение из чата, где был этот текст (модель чаще
+        цитирует так, чем по номеру; раньше это уходило ответом на последнее сообщение, а цитата — текстом).
+        Возвращает (raw без цитаты, message_id или 0).
+        """
+        tag = re.search(r'<reply(?:\s+(?:id|to)\s*=\s*"?(\d+)"?)?\s*(/?)>', raw)
+        if not tag:
+            return raw, 0
+        if tag.group(1):
+            return raw, int(tag.group(1))
+        current = self.reply_channel.get("message_id", 0)
+        closing = raw.find("</reply>", tag.end()) if not tag.group(2) else -1
+        quote = raw[tag.end():closing].strip() if closing >= 0 else ""
+        found = (self.telegram.find_message(self.reply_channel.get("chat_id"), quote)
+                 if quote and self.telegram is not None else 0)
+        if found:  # сама цитата в текст ответа не идёт
+            return raw[:tag.start()] + raw[closing + len("</reply>"):], found
+        return raw, current  # в <reply>…</reply> был не текст из чата, а её ответ — он остаётся
 
     def _speak_buffer(self):
         # Язык фрагмента без слов (эмодзи) — как у соседних фраз ответа, чтобы "😊" посреди

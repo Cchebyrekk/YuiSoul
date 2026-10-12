@@ -24,6 +24,8 @@ class FakeTTS:
 @pytest.fixture
 def env(monkeypatch, mm, memory_dir, llm):
     monkeypatch.setattr(loop, "extract_and_save_facts", lambda *a, **k: None)
+    # описания картинок для памяти в фоне забирали бы поддельные ответы LLM у самого хода — их проверяют отдельно
+    monkeypatch.setattr(loop, "remember_images_later", lambda *a, **k: None)
     monkeypatch.setattr(loop, "save_session", lambda messages: None)
     monkeypatch.setattr(loop, "load_session", lambda: None)
     monkeypatch.setattr(loop, "WILL_CHECK_ENABLED", False)

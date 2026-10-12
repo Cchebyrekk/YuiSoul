@@ -35,6 +35,29 @@ _CHANGING_WORDS = {
 }
 
 
+# Папки пользователя из реестра Windows: «Рабочий стол» часто не %USERPROFILE%\Desktop, а в OneDrive —
+# Юи создала папку «на рабочем столе» по стандартному пути, и её там не оказалось (замерено)
+_KNOWN_FOLDERS = (("Рабочий стол", "Desktop"), ("Документы", "Personal"),
+                  ("Загрузки", "{374DE290-123F-4565-9164-39C4925E467B}"), ("Изображения", "My Pictures"))
+
+
+def known_folders() -> str:
+    """«Рабочий стол — C:\\Users\\...\\OneDrive\\Desktop; Документы — ...» или пусто, если не Windows."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+            found = []
+            for label, name in _KNOWN_FOLDERS:
+                try:
+                    found.append(f"{label} — {winreg.QueryValueEx(key, name)[0]}")
+                except OSError:
+                    continue
+        return "; ".join(found)
+    except (ImportError, OSError):
+        return ""
+
+
 def confirmation_reason(command: str) -> Optional[str]:
     """Почему команде нужно подтверждение (None — только читает/показывает)."""
     for m in _CHANGING_CMDLET_RE.finditer(command):
