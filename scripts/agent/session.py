@@ -24,6 +24,11 @@ def guest_session_file(user_id: int) -> str:
     return os.path.join(os.path.dirname(SESSION_FILE), f"tg_{int(user_id)}.json")
 
 
+def group_session_file(chat_id: int) -> str:
+    """История группового чата — своя у каждой группы."""
+    return os.path.join(os.path.dirname(SESSION_FILE), f"tg_group_{abs(int(chat_id))}.json")
+
+
 def save_session(messages: list, path: str = None):
     """Сохраняет историю сообщений в файл сессии (по умолчанию — владельца, SESSION_FILE)."""
     path = path or SESSION_FILE

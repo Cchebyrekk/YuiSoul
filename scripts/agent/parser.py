@@ -9,6 +9,28 @@ import re
 from typing import Dict, List, Tuple, Optional, Any
 
 MAX_TOOL_ARGUMENTS_CHARS = 20000  # больше — это не аргументы, а зацикленная генерация
+REPEAT_SENTENCE_MIN_CHARS = 25     # короче («Ахаха!», «Держи:») повторять нормально
+
+
+def _sentence_key(sentence: str) -> str:
+    return " ".join(re.sub(r"[^\w ]", " ", sentence.lower()).split())
+
+
+def find_repetition(text: str) -> Optional[int]:
+    """
+    Модель пошла по кругу: та же длинная фраза второй раз. Возвращает позицию начала строки с повтором — всё с неё
+    лишнее; None — повторов нет. Замерено: ответ из 4 абзацев со стикерами повторялся до лимита токенов и целиком
+    ушёл в Telegram.
+    """
+    seen = set()
+    for match in re.finditer(r"[^.!?…\n]+[.!?…]*", text):
+        key = _sentence_key(match.group(0))
+        if len(key) < REPEAT_SENTENCE_MIN_CHARS:
+            continue
+        if key in seen:
+            return text.rfind("\n", 0, match.start()) + 1
+        seen.add(key)
+    return None
 
 
 def sanitize_tool_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -128,6 +150,12 @@ class StreamParser:
             # Если тега нет, весь текст считается ответом (но мы всё равно проверим на tool_calls)
             pass
 
+        # 2б. Зацикливание: всё с первого повтора — лишнее (и вызовы, написанные в нём текстом, тоже)
+        cut = find_repetition(final_reply)
+        if cut is not None:
+            print(f"\n[PARSER] Ответ пошёл по кругу — обрезаю повтор ({len(final_reply) - cut} симв.).")
+            final_reply = final_reply[:cut].rstrip()
+
         # 3. Извлечение XML-тегов <tool_call> (фолбэк)
         # Ищем все <tool_call>{...}</tool_call>
         tc_matches = re.findall(r'<tool_call>\s*({.*?})\s*</tool_call>', final_reply, re.DOTALL)
@@ -211,6 +239,13 @@ class StreamParser:
     def _extract_text_tool_calls(self, text: str) -> str:
         """Находит вызовы вида name{json} и <name>...</name> для известных инструментов, вырезает их из текста."""
         def add(name, args):
+            if name == "sticker" and args.get("action") == "send":
+                # Один стикер за ответ: больше — это уже спам (замерено: десятки подряд в зацикленном ответе)
+                if any(json.loads(c["function"]["arguments"]).get("action") == "send"
+                       for c in self.tool_calls if c["function"]["name"] == "sticker"):
+                    return
+            if name == "sticker" and not args:
+                return  # оборванный «<sticker>» без ID — вызывать нечего
             self.tool_calls.append({"id": f"text_{len(self.tool_calls)}", "type": "function",
                                     "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
 
@@ -231,10 +266,27 @@ class StreamParser:
             name = match.group(1)
             if name not in self.known_tools:
                 return match.group(0)
-            reason = re.sub(r'<[^>]+>', ' ', match.group(2) or "").strip()
-            add(name, {"reason": reason} if name in ("task_complete", "stay_silent") else {})
+            inner = match.group(2) or ""
+            # Аргументы вложенными тегами: <sticker><action>send</action><sticker_id>X</sticker_id></sticker> —
+            # раньше они терялись, и вызов уходил пустым (замерено: «Неизвестное действие» вместо стикера)
+            args = {k: v.strip() for k, v in re.findall(r'<([a-z_]+)>(.*?)</\1>', inner, flags=re.DOTALL)}
+            plain = re.sub(r'<[^>]+>', ' ', inner).strip()
+            if name in ("task_complete", "stay_silent"):
+                args = {"reason": args.get("reason", plain)}
+            elif name == "sticker" and not args and plain:
+                args = {"action": "send", "sticker_id": plain}           # <sticker>ID</sticker>
+            if name == "sticker" and args.get("sticker_id") and not args.get("action"):
+                args["action"] = "send"
+            add(name, args)
             return ""
 
+        def sticker_attr(match):  # <sticker id="X"/> — короткая форма отправки стикера
+            if "sticker" not in self.known_tools:
+                return match.group(0)
+            add("sticker", {"action": "send", "sticker_id": match.group(1)})
+            return ""
+
+        text = re.sub(r'<sticker\s+(?:sticker_)?id\s*=\s*"?([\w-]+)"?\s*/?>(?:\s*</sticker>)?', sticker_attr, text)
         text = re.sub(r'<([a-z_]+)>(.*?)(?:</\1>|$)', tag_call, text, flags=re.DOTALL)
         return text.strip()
 

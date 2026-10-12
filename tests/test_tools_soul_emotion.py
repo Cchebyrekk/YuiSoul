@@ -67,6 +67,35 @@ def test_soul_patch(memory_dir):
     assert "Не черта характера" not in patch and "Заголовок" not in patch
 
 
+def test_soul_patch_stays_small_and_takes_newest(memory_dir):
+    """Три дня работы: заметки рефлексии разрослись — душа не растёт вместе с ними (было 29 тыс. симв. на реплику)."""
+    write_facts(memory_dir, "reflections/reflection_notes",
+                [f"- [2026-09-{d:02d} 12:00] (c=+0.90) Заметка номер {d}: " + "очень длинная мысль " * 30 for d in range(1, 29)])
+    write_facts(memory_dir, "system/yui/yui_character",
+                [f"- [2026-09-{d:02d} 10:00] Черта {d} " + "слово " * 40 for d in range(1, 29)])
+    write_facts(memory_dir, "user/interests",
+                [f"- [2026-09-{d:02d} 09:00] Интерес {d} " + "слово " * 40 for d in range(1, 29)])
+    patch = SoulManager(base_dir=str(memory_dir)).generate_soul_patch()
+    assert len(patch) < 4500
+    assert "Заметка номер 28:" in patch and "Заметка номер 1:" not in patch      # свежее, а не первое в файле
+    assert "Черта 28" in patch and "Интерес 28" in patch
+    assert "(c=" not in patch and "[2026-09" not in patch                        # без дат и меток доверия
+
+
+def test_soul_patch_skips_tool_markup_and_keeps_note_order(memory_dir):
+    """Обрывки вызова инструмента, сохранённые как «факты», в душу не идут (замерено в reflection_notes.md)."""
+    write_facts(memory_dir, "reflections/reflection_notes", [
+        "- [2026-09-28 18:34] Он ищет скрытый смысл в простых мемах.",
+        "</function>", "</tool_call>", "<tool_call>", "<function=save_memory>", "<parameter=path>",
+        "reflections/reflection_notes",
+        "продолжение той же заметки без даты",
+        "- [2026-09-29 10:00] Свежая заметка."])
+    patch = SoulManager(base_dir=str(memory_dir)).generate_soul_patch()
+    assert "<function" not in patch and "<parameter" not in patch and "tool_call" not in patch
+    assert "reflections/reflection_notes" not in patch
+    assert patch.index("скрытый смысл") < patch.index("продолжение той же") < patch.index("Свежая заметка")
+
+
 def test_dynamic_state_and_static_prompt(memory_dir, monkeypatch):
     write_facts(memory_dir, "user/pets", ["- Кот"])
     state = prompt_mod.get_dynamic_state(memory_base_dir=str(memory_dir), soul_patch="SOUL")

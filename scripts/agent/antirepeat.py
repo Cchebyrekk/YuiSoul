@@ -2,17 +2,32 @@
 """
 Защита от самоповторов (идея из kuni): новая реплика Юи сравнивается по смыслу (e5) с её последними —
 почти то же самое (пересказ своих же слов) отклоняется с просьбой сказать по-другому.
-Замер на e5: повтор и пересказ — 0.92-0.96, похожие по теме, но другие реплики — 0.83-0.87.
+Одной близости e5 мало: короткие реплики на общую тему тоже дают 0.92-0.95 («Готово, папка на рабочем столе» и
+«Вот скриншот рабочего стола» — 0.924). Замер: пересказы — 0.949-0.975 и общих основ слов 17-62%, ложные — 0.924-0.950
+и 11-27%. Повтор — если очень близко по смыслу (>= REPEAT_SURE) или близко и много общих слов (>= REPEAT_WORD_OVERLAP).
 Короткие реплики («Привет! Как дела?», «Хорошо») не проверяются: их повторять нормально.
 """
+import re
 from collections import deque
 from typing import Callable, Optional
 
 import numpy as np
 
 REPEAT_THRESHOLD = 0.92
+REPEAT_SURE = 0.965
+REPEAT_WORD_OVERLAP = 0.35
 REPEAT_MIN_CHARS = 25
 REPEAT_WINDOW = 20
+
+
+def word_stems(text: str) -> set:
+    """Основы слов (первые 5 букв) — грубо, но «рабочем»/«рабочего» совпадут."""
+    return {w[:5] for w in re.findall(r"[a-zа-яё0-9]+", text.lower()) if len(w) >= 3}
+
+
+def word_overlap(a: str, b: str) -> float:
+    a, b = word_stems(a), word_stems(b)
+    return len(a & b) / max(1, len(a | b))
 
 
 class AntiRepeat:
@@ -36,7 +51,8 @@ class AntiRepeat:
         best_text, best = None, self.threshold
         for old_text, old_vector in self._recent:
             score = float(np.dot(vector, old_vector))
-            if score >= best:
+            repeated = score >= REPEAT_SURE or word_overlap(text, old_text) >= REPEAT_WORD_OVERLAP
+            if score >= best and repeated:
                 best_text, best = old_text, score
         return best_text
 

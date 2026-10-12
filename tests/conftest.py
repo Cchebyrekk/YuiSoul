@@ -40,6 +40,10 @@ class BagOfWordsModel:
 def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(vector_mod, "SentenceTransformer", BagOfWordsModel)
     monkeypatch.setattr(vector_mod, "MEMORY_DIR", str(tmp_path / "memory"))
+    from scripts.memory.people import people
+    monkeypatch.setattr(people, "path", str(tmp_path / "memory" / "people.json"))
+    import scripts.telegram.stickers as stickers_mod
+    monkeypatch.setattr(stickers_mod, "STICKERS_PATH", str(tmp_path / "memory" / "telegram_stickers.json"))
 
     def no_network(*args, **kwargs):
         raise AssertionError("тест попытался сделать настоящий HTTP-запрос")

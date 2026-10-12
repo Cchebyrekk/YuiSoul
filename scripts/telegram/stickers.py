@@ -12,11 +12,12 @@ import threading
 from scripts.config import MEMORY_DIR
 
 STICKERS_PATH = os.path.join(MEMORY_DIR, "telegram_stickers.json")
+MAX_STICKERS = 60
 
 
 class StickerGallery:
-    def __init__(self, path: str = STICKERS_PATH):
-        self.path = path
+    def __init__(self, path: str = None):
+        self.path = path or STICKERS_PATH  # при вызове, а не при def: тесты подменяют путь
         self._lock = threading.Lock()
 
     def _load(self) -> list:
@@ -36,11 +37,18 @@ class StickerGallery:
             stickers = [s for s in self._load() if s["sticker_id"] != sticker["sticker_id"]]
             stickers.append({**sticker, "note": note.strip(),
                              "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")})
+            stickers = stickers[-MAX_STICKERS:]  # новые Юи копит сама — самые старые уходят
             self._write(stickers)
         return f"Стикер {sticker.get('emoji', '')} сохранён ({len(stickers)} в коллекции)."
 
     def get(self, sticker_id: str):
         return next((s for s in self._load() if s["sticker_id"] == sticker_id), None)
+
+    def short_listing(self, limit: int = 20) -> str:
+        """Коллекция одной строкой для пометки к сообщению: чтобы слать стикер сразу, без action=list."""
+        stickers = self._load()[-limit:]
+        return "; ".join(f"{s['sticker_id']} {s.get('emoji', '')}{' — ' + s['note'] if s.get('note') else ''}"
+                         for s in stickers)
 
     def listing(self) -> str:
         stickers = self._load()

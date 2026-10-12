@@ -14,7 +14,8 @@ from scripts.config import (
     MAX_CONTEXT_CHARS,
     CONTEXT_TAIL_RATIO,
     LLM_API_URL,
-    FACT_EXTRACTION_IDLE_DELAY
+    FACT_EXTRACTION_IDLE_DELAY,
+    MAX_MODEL_CONFIDENCE,
 )
 from scripts.memory.manager import MemoryManager, parse_fact_lines
 from scripts.agent.prompt import get_dynamic_state
@@ -81,7 +82,7 @@ def compress_context(messages: List[Dict[str, str]], memory_manager: Optional[Me
 
 def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: MemoryManager, wait: bool = False,
                            max_wait: Optional[float] = None, force_path: Optional[str] = None,
-                           tools: Optional[list] = None):
+                           tools: Optional[list] = None, force_label: str = ""):
     """
     Извлекает факты из истории (обычно из удалённой части) и сохраняет в память.
     Работает в фоновом потоке, если wait=False. max_wait — сколько секунд ждать при wait=True
@@ -108,8 +109,11 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
         cleaned_history = []
         for msg in history_snapshot:
             content = content_text(msg.get("content", ""))
-            # Удаляем системные события
-            clean_content = re.sub(r'<system_event>.*?</system_event>', '', content, flags=re.DOTALL)
+            # Служебное и её мысли — не слова разговора: в <injected_context> — то, что уже лежит в памяти (в т.ч.
+            # о других людях), и извлечение записывало это заново, приписывая пользователю (замерено: слова гостя
+            # оказались в файле владельца); <inner_thought> — её догадки, а не факты
+            clean_content = re.sub(r'<(system_event|injected_context|system_note|system_warning|things_to_remember'
+                                   r'|inner_thought)>.*?</\1>', '', content, flags=re.DOTALL)
             clean_content = clean_content.strip()
             if clean_content:
                 cleaned_history.append({"role": msg["role"], "content": clean_content})
@@ -172,8 +176,14 @@ def extract_and_save_facts(history: List[Dict[str, str]], memory_manager: Memory
                 if any(line.lower().startswith(kw) for kw in garbage_keywords):
                     continue
                 for path, confidence, fact in parse_fact_lines(line):
-                    # Разговор с гостем из Telegram — только в его файл, не в память о владельце
-                    path = force_path or path
+                    # Разговор с гостем из Telegram — только в его файл, не в память о владельце. Дневник — её
+                    # собственные чувства, он остаётся дневником (раньше они оседали в файле гостя как факты о нём)
+                    if force_path and path.startswith("diary/"):
+                        fact = f"(в переписке с {force_label or 'гостем'}) {fact}"
+                    elif force_path:
+                        path = force_path
+                    # Якорь (c=1) ставит только пользователь, подтверждая факт (verify_fact), — не модель
+                    confidence = min(confidence, MAX_MODEL_CONFIDENCE)
                     if len(fact) > 5:
                         valid_facts.add((path, fact, confidence))
 

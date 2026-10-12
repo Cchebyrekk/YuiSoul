@@ -273,7 +273,7 @@ def test_incoming_sticker_is_seen_and_can_be_saved_and_sent(tmp_path, monkeypatc
     assert meta["kind"] == "sticker" and meta["sticker_id"] == "U1" and meta["emoji"] == "😂"
     assert meta["images"][0].startswith("data:image/jpeg;base64,")
     note = telegram_note(meta, now=1000)
-    assert "sticker_id=U1" in note and "Картинка приложена" in note
+    assert "sticker_id=U1" in note and "Картинка стикера приложена" in note
 
     gallery = StickerGallery(str(tmp_path / "stickers.json"))
     assert "Коллекция пуста" in sticker_handler(gallery, bot, "list")

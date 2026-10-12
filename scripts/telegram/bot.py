@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -20,17 +21,29 @@ from typing import Callable, Optional
 import requests
 from PIL import Image
 
-from scripts.config import (TELEGRAM_BATCH_WINDOW, TELEGRAM_GUEST_MAX_PER_HOUR, TELEGRAM_GUESTS_ENABLED,
+from scripts.agent.rooms import calls_yui
+from scripts.tools.frames import SHEET_FRAMES, VIDEO_SHEET_FRAMES, animation_sheet, lottie_sheet
+from scripts.config import (TELEGRAM_BATCH_WINDOW, TELEGRAM_GROUP_BATCH_WINDOW, TELEGRAM_GROUP_REQUIRE_OWNER,
+                            TELEGRAM_GROUPS_ENABLED, TELEGRAM_GUEST_MAX_PER_HOUR, TELEGRAM_GUESTS_ENABLED,
                             TELEGRAM_MAX_MESSAGE, TELEGRAM_NOTIFY_OWNER_ABOUT_GUESTS, TELEGRAM_POLL_TIMEOUT)
 
 API_URL = "https://api.telegram.org/bot{token}/{method}"
 FILE_URL = "https://api.telegram.org/file/bot{token}/{path}"
 PHOTO_MAX_SIDE = 1600  # из размеров, которые отдаёт Telegram, берём самый крупный не больше этого
+RECENT_MESSAGES_KEPT = 100  # сколько входящих сообщений на чат помнить для цитаты по тексту
+STICKER_MIN_SIDE = 512      # превью анимированного стикера (128 px) увеличиваем до этого
+ANIMATION_MAX_BYTES = 20 * 1024 * 1024  # больше бот скачать не может (лимит Bot API) — тогда только превью
 
 # Реакции, которые бот может поставить (ReactionTypeEmoji в Bot API); другие Telegram отклоняет
 REACTION_EMOJI = ("👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 "
                   "🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 "
                   "😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡").split()
+
+
+def _jpeg_data_url(image: Image.Image) -> str:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=90)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def split_message(text: str, limit: int = TELEGRAM_MAX_MESSAGE) -> list:
@@ -60,11 +73,14 @@ class TelegramBot:
         self._pending = {}  # токен кнопок подтверждения -> {event, granted}
         self.last_message_id = 0  # последнее сообщение владельца — для реакций по умолчанию
         self.recent_stickers = {}  # sticker_id (file_unique_id) -> стикер, присланный владельцем (для сохранения)
+        self.recent_messages = {}  # chat_id -> последние входящие [(message_id, текст)] — для цитаты по тексту
         self.batch_window = TELEGRAM_BATCH_WINDOW
         self._batches = {}        # chat_id -> копящаяся пачка сообщений
         self._batch_timers = {}
         self._guest_times = {}    # user_id гостя -> время его сообщений за последний час (лимит)
         self._known_guests = set()
+        self._groups_checked = {}  # chat_id группы -> можно ли там говорить (есть ли в ней владелец)
+        self.me = None             # сам бот (getMe): id и username — чтобы понять, что в группе обращаются к Юи
         self._batch_lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -112,6 +128,29 @@ class TelegramBot:
                 params["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
             ok = self.api("sendMessage", **params) is not None and ok
         return ok
+
+    def remember_message(self, chat_id: int, message_id: int, text: str):
+        if message_id and text:
+            recent = self.recent_messages.setdefault(chat_id, [])
+            recent.append((message_id, text))
+            del recent[:-RECENT_MESSAGES_KEPT]
+
+    def find_message(self, chat_id: Optional[int], quote: str) -> int:
+        """message_id недавнего сообщения в чате, где был этот текст (сначала точное совпадение, потом вхождение); 0 — нет."""
+        def norm(s):
+            return " ".join(re.sub(r"[^\w\s]", " ", s.lower()).split())
+        quote = norm(quote or "")
+        recent = list(reversed(self.recent_messages.get(chat_id or self.owner_id, [])))
+        if not quote:
+            return 0
+        for message_id, text in recent:
+            if norm(text) == quote:
+                return message_id
+        for message_id, text in recent:
+            text = norm(text)
+            if len(quote) >= 3 and (quote in text or (len(text) >= 3 and text in quote)):
+                return message_id
+        return 0
 
     def react(self, emoji: str, message_id: int = 0, chat_id: Optional[int] = None) -> str:
         """Реакция на сообщение (по умолчанию — на последнее от владельца)."""
@@ -230,9 +269,9 @@ class TelegramBot:
         if self._running:
             return
         self._running = True
+        me = self.me = self.api("getMe", timeout=10)  # до опроса: в группе по нему узнаём обращения к Юи
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-        me = self.api("getMe", timeout=10)
         name = f"@{me['username']}" if me else "(пока нет связи с Telegram)"
         print(f"[TELEGRAM] Бот {name} слушает сообщения."
               + ("" if self.owner_id else " Напиши ему /start — он назовёт твой ID для .env."))
@@ -263,6 +302,8 @@ class TelegramBot:
                                             "allowed_updates": ["message", "callback_query"]},
                                       timeout=TELEGRAM_POLL_TIMEOUT + 10)
             data = response.json()
+        except requests.ReadTimeout:
+            return []  # долгий опрос не дождался ответа — обычное дело при плохой сети, просто спрашиваем снова
         except (requests.RequestException, ValueError) as e:
             print(f"[TELEGRAM] Нет связи: {type(e).__name__}")
             return None
@@ -285,8 +326,14 @@ class TelegramBot:
             self.send_text(f"Твой Telegram ID: {user_id}. Впиши его в .env как YUI_TELEGRAM_OWNER_ID "
                            f"и перезапусти Юи.", chat_id=chat_id)
             return
-        guest = user_id != self.owner_id
-        if guest:
+        group = message["chat"].get("type") in ("group", "supergroup")
+        guest = user_id != self.owner_id and not group
+        if group:
+            # Группа: только если включено и ты там есть (иначе любой мог бы добавить Юи к себе)
+            if not TELEGRAM_GROUPS_ENABLED or (message.get("from") or {}).get("is_bot") or \
+                    not self._group_allowed(chat_id, user_id):
+                return
+        elif guest:
             # Другие люди: только личные чаты, если гости разрешены, и с лимитом сообщений
             if not TELEGRAM_GUESTS_ENABLED or message["chat"].get("type") != "private":
                 print(f"[TELEGRAM] Игнорирую сообщение от чужого ID {user_id}.")
@@ -298,41 +345,76 @@ class TelegramBot:
 
         text = (message.get("text") or message.get("caption") or "").strip()
         if text.startswith("/"):
-            if text.split()[0] != "/start":
+            command = text.split()[0]
+            if command in ("/good", "/bad") and not guest and not group:
+                # Оценка последнего обмена для набора диалогов (scripts/agent/dataset.py) — ставит основной цикл
+                if self.input_queue is not None:
+                    self.input_queue.put(("rate", command[1:], {"chat_id": chat_id}))
+                return
+            if group or command != "/start":
                 return
             if not guest:
                 self.send_text("Я на связи.", chat_id=chat_id)
                 return
             text = "(открыл чат с тобой и нажал «Старт»)"  # гость пришёл впервые — пусть Юи сама поздоровается
 
-        if not guest:
+        if not guest and not group:
             self.last_message_id = message.get("message_id", self.last_message_id)
+        self.remember_message(chat_id, message.get("message_id", 0), text)
         kind, images, extra = "text", [], {}
+        # GIF в Telegram — это animation (mp4), видео и кружки — video/video_note: Юи видит их превью-кадр
+        moving = message.get("animation") or message.get("video") or message.get("video_note")
         if message.get("sticker"):
             kind = "sticker"
             sticker = message["sticker"]
             extra = {"sticker_id": sticker.get("file_unique_id", ""), "emoji": sticker.get("emoji", ""),
-                     "set_name": sticker.get("set_name", "")}
+                     "set_name": sticker.get("set_name", ""),
+                     "animated": bool(sticker.get("is_animated") or sticker.get("is_video"))}
             self.recent_stickers[extra["sticker_id"]] = {"file_id": sticker["file_id"], **extra}
-            image = self._sticker_data_url(sticker)
+            image, extra["frames"] = self._sticker_data_url(sticker)
+            print(f"[TELEGRAM] Стикер {extra['emoji']}: " + (
+                f"раскадровка из {extra['frames']} кадров." if image and extra["frames"] else
+                "картинка для зрения есть." if image else "картинку получить не удалось — Юи знает только эмодзи."))
+            if image:
+                images.append(image)
+        elif moving:
+            kind = "gif" if message.get("animation") else "video"
+            thumb = (moving.get("thumbnail") or {}).get("file_id")
+            image, extra["frames"], speech = self._animation_data_url(
+                moving.get("file_id"), thumb, moving.get("file_size", 0),
+                frames=SHEET_FRAMES if kind == "gif" else VIDEO_SHEET_FRAMES, with_speech=kind == "video")
+            if speech:
+                text = f"{text}\n[в видео говорят: {speech}]".strip()
             if image:
                 images.append(image)
         elif message.get("voice") or message.get("audio"):
             kind = "voice"
             spoken = self._transcribe((message.get("voice") or message.get("audio"))["file_id"])
-            if not spoken:
+            if not spoken and not group:
                 self.send_text("Не разобрала голосовое, напиши текстом?", chat_id=chat_id)
                 return
-            text = f"{text}\n{spoken}".strip()
+            text = f"{text}\n{spoken or '[голосовое, не разобрала]'}".strip()
         elif message.get("photo"):
             kind = "photo"
             image = self._photo_data_url(message["photo"])
-            if not image:
+            if not image and not group:
                 self.send_text("Не получилось скачать фото.", chat_id=chat_id)
                 return
-            images.append(image)
+            images += [image] if image else []
+        elif (message.get("document") or {}).get("mime_type", "").startswith("image/"):
+            kind = "photo"  # картинка, присланная файлом
+            image = self._image_data_url(message["document"]["file_id"])
+            if not image and not group:
+                self.send_text("Не получилось открыть картинку.", chat_id=chat_id)
+                return
+            images += [image] if image else []
         elif not text:
-            self.send_text("Пока понимаю только текст, голосовые и фото.", chat_id=chat_id)
+            if not group:  # в группе на всё подряд не отвечаем
+                self.send_text("Пока понимаю только текст, голосовые, фото, стикеры и гифки.", chat_id=chat_id)
+            return
+
+        if group:
+            self._add_group_message(message, text, kind, images, extra)
             return
 
         print(f"\n[TELEGRAM INPUT] ({kind}): {text or extra.get('emoji') or '[фото]'}")
@@ -344,6 +426,49 @@ class TelegramBot:
             "chat_id": chat_id, "kind": kind, "images": images,
             "message_id": message.get("message_id", 0), **extra, **guest_info,
         }, source="telegram_guest" if guest else "telegram")
+
+    # ---------- Групповые чаты ----------
+    def _group_allowed(self, chat_id: int, sender_id: int) -> bool:
+        """Группа, где есть владелец (проверяется один раз через getChatMember и запоминается)."""
+        if not TELEGRAM_GROUP_REQUIRE_OWNER:
+            return True
+        if chat_id not in self._groups_checked:
+            if sender_id == self.owner_id:
+                allowed = True
+            else:
+                member = self.api("getChatMember", timeout=10, chat_id=chat_id, user_id=self.owner_id)
+                allowed = bool(member) and member.get("status") in ("creator", "administrator", "member", "restricted")
+            if not allowed:
+                print(f"[TELEGRAM] Группа {chat_id}: тебя там нет — Юи в ней молчит.")
+            self._groups_checked[chat_id] = allowed
+        return self._groups_checked[chat_id]
+
+    def addresses_me(self, message: dict, text: str) -> bool:
+        """В группе обращаются к Юи: @упоминание бота, ответ на её сообщение или её имя."""
+        username = (self.me or {}).get("username", "")
+        if username and f"@{username.lower()}" in text.lower():
+            return True
+        replied = ((message.get("reply_to_message") or {}).get("from") or {}).get("id")
+        if replied and replied == (self.me or {}).get("id"):
+            return True
+        return calls_yui(text)
+
+    def _add_group_message(self, message: dict, text: str, kind: str, images: list, extra: dict):
+        sender = message.get("from") or {}
+        user_id, chat_id = sender.get("id"), message["chat"]["id"]
+        name = sender.get("first_name") or sender.get("username") or "кто-то"
+        if user_id == self.owner_id:
+            name += " (твой человек)"
+        what = text or {"sticker": f"[стикер {extra.get('emoji', '')}]", "photo": "[картинка]", "gif": "[гифка]",
+                        "video": "[видео]"}.get(kind, "[сообщение]")
+        print(f"\n[TELEGRAM ГРУППА {message['chat'].get('title', chat_id)}] {name}: {what}")
+        addressed = self.addresses_me(message, text)
+        self._add_to_batch(f"{name}: {what}", {
+            "timestamp": time.time(), "sent_at": message.get("date", time.time()), "chat_id": chat_id,
+            "kind": kind, "images": images, "message_id": message.get("message_id", 0),
+            "group": {"id": chat_id, "title": message["chat"].get("title", "")},
+            "speakers": [user_id], "addressed_by": [user_id] if addressed else [], **extra,
+        }, source="telegram_group")
 
     # ---------- Пачки сообщений ----------
     # В мессенджере пишут несколькими сообщениями подряд (и альбомом фото): ждём TELEGRAM_BATCH_WINDOW секунд
@@ -360,6 +485,9 @@ class TelegramBot:
                 if text:
                     batch["texts"].append(text)
                 batch["images"] = batch["images"] + meta["images"]
+                for key in ("speakers", "addressed_by"):  # группа: кто писал и кто звал Юи — за всю пачку
+                    if key in meta:
+                        meta = {**meta, key: batch.get(key, []) + meta[key]}
                 batch["message_ids"].append(meta["message_id"])
                 batch["message_id"] = meta["message_id"]
                 # Голосом — если хоть одно голосовое; стикер помним последний
@@ -370,8 +498,9 @@ class TelegramBot:
             if timer is not None:
                 timer.cancel()
             flush_now = self.batch_window <= 0  # без ожидания (тесты)
+            window = max(self.batch_window, TELEGRAM_GROUP_BATCH_WINDOW) if source == "telegram_group" else self.batch_window
             if not flush_now:
-                timer = threading.Timer(self.batch_window, self._flush_batch, args=(chat_id,))
+                timer = threading.Timer(window, self._flush_batch, args=(chat_id,))
                 timer.daemon = True
                 self._batch_timers[chat_id] = timer
                 timer.start()
@@ -413,33 +542,67 @@ class TelegramBot:
     def _transcribe(self, file_id: str) -> str:
         if self.transcribe is None:
             return ""
-        audio = self.download(file_id)
-        if not audio:
+        return self._transcribe_data(self.download(file_id))
+
+    def _transcribe_data(self, audio: Optional[bytes]) -> str:
+        """Речь из аудио или видео (Whisper сам достаёт звуковую дорожку); нет звука или речи — пусто."""
+        if self.transcribe is None or not audio:
             return ""
         try:
             text, _ = self.transcribe(audio)
             return text
         except Exception as e:
-            print(f"[TELEGRAM] Не удалось распознать голосовое: {type(e).__name__}: {e}")
+            print(f"[TELEGRAM] Не удалось распознать речь: {type(e).__name__}: {e}")
             return ""
 
-    def _sticker_data_url(self, sticker: dict) -> Optional[str]:
-        """Картинка стикера для зрения: у анимированных и видео — превью, у обычных — сам webp (-> JPEG)."""
-        animated = sticker.get("is_animated") or sticker.get("is_video")
-        file_id = (sticker.get("thumbnail") or {}).get("file_id") if animated else sticker.get("file_id")
-        data = self.download(file_id) if file_id else None
+    def _sticker_data_url(self, sticker: dict) -> tuple:
+        """
+        Картинка стикера для зрения -> (data URL или None, кадров в раскадровке). Обычный — сам webp; видео-стикер
+        (webm) — раскадровка из 4 кадров; анимированный .tgs (Lottie, отрисовать нечем) — превью, увеличенное:
+        превью всего 128 px, и надпись на нём модель не читала.
+        """
+        thumb = (sticker.get("thumbnail") or {}).get("file_id")
+        if sticker.get("is_video"):
+            return self._animation_data_url(sticker["file_id"], thumb, sticker.get("file_size", 0))[:2]
+        if sticker.get("is_animated"):
+            data = self.download(sticker["file_id"])
+            sheet, count = lottie_sheet(data) if data else (None, 0)
+            if sheet is not None:
+                return _jpeg_data_url(sheet), count
+            return (self._image_data_url(thumb, min_side=STICKER_MIN_SIDE) if thumb else None), 0
+        return self._image_data_url(sticker["file_id"]), 0
+
+    def _animation_data_url(self, file_id: str, thumb_id: Optional[str], size: int = 0,
+                            frames: int = SHEET_FRAMES, with_speech: bool = False) -> tuple:
+        """
+        Гифка/видео/видео-стикер -> (раскадровка, число кадров, речь из звуковой дорожки); не вышло — (превью, 0, "").
+        Речь — только если with_speech (видео и кружки: там главное часто то, что говорят).
+        """
+        data = self.download(file_id) if file_id and (size or 0) <= ANIMATION_MAX_BYTES else None
+        speech = self._transcribe_data(data) if data and with_speech else ""
+        sheet, count = animation_sheet(data, frames) if data else (None, 0)
+        if sheet is not None:
+            return _jpeg_data_url(sheet), count, speech
+        return (self._image_data_url(thumb_id, min_side=STICKER_MIN_SIDE) if thumb_id else None), 0, speech
+
+    def _image_data_url(self, file_id: str, min_side: int = 0) -> Optional[str]:
+        """Файл-картинка из Telegram (webp, png, jpeg, первый кадр gif) -> JPEG data URL; прозрачность -> белый фон."""
+        data = self.download(file_id)
         if not data:
             return None
         try:
             with Image.open(io.BytesIO(data)) as img:
+                img.seek(0)
                 rgba = img.convert("RGBA")
-            flat = Image.new("RGB", rgba.size, (255, 255, 255))   # прозрачный фон -> белый
+            rgba.thumbnail((PHOTO_MAX_SIDE, PHOTO_MAX_SIDE))
+            if min_side and max(rgba.size) < min_side:  # крошечное превью — увеличить, чтобы разобрать надпись
+                scale = min_side / max(rgba.size)
+                rgba = rgba.resize((round(rgba.width * scale), round(rgba.height * scale)), Image.LANCZOS)
+            flat = Image.new("RGB", rgba.size, (255, 255, 255))
             flat.paste(rgba, mask=rgba.split()[3])
-            buf = io.BytesIO()
-            flat.save(buf, format="JPEG", quality=90)
-            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+            return _jpeg_data_url(flat)
         except Exception as e:
-            print(f"[TELEGRAM] Не удалось открыть стикер: {e}")
+            print(f"[TELEGRAM] Не удалось открыть картинку: {e}")
             return None
 
     def _photo_data_url(self, sizes: list) -> Optional[str]:

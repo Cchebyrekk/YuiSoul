@@ -9,7 +9,7 @@ from scripts.tools import mouse, shell
 from scripts.tools.approval import approval
 from scripts.tools.control import ComputerControl
 from scripts.memory.manager import MemoryManager
-from scripts.config import TELEGRAM_ENABLED, VISION_ENABLED, WEB_ENABLED
+from scripts.config import MAX_MODEL_CONFIDENCE, TELEGRAM_ENABLED, VISION_ENABLED, WEB_ENABLED
 from scripts.tools.vision import capture_screen_jpeg, vision
 from scripts.tools.web import search_web, read_webpage
 from scripts.telegram.bot import REACTION_EMOJI
@@ -381,6 +381,8 @@ RUN_COMMAND_TOOL = {
             "подтверждения пользователем — он увидит команду и нажмёт «Да» или «Нет». Не пиши скрипты там, где есть "
             "готовый инструмент: скриншот — look_at_screen (себе) или send_telegram со screenshot (ему), клики — "
             "mouse_click, запуск программ — open_app."
+            + (f" Папки пользователя (пиши эти пути, а не $env:USERPROFILE\\Desktop): {shell.known_folders()}."
+               if shell.known_folders() else "")
         ),
         "parameters": {
             "type": "object",
@@ -409,7 +411,8 @@ TELEGRAM_TOOLS = [
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Текст сообщения (или подпись к скриншоту/файлу)"},
-                    "screenshot": {"type": "integer", "description": "Приложить снимок экрана: 0 — все мониторы, N — монитор N. Не указывай, если скриншот не нужен"},
+                    "screenshot": {"type": "integer", "description": "Приложить свежий снимок экрана: 0 — все мониторы, N — монитор N. Не указывай, если скриншот не нужен"},
+                    "image": {"type": "boolean", "description": "true — приложить картинку, которую ты сейчас рассматриваешь, ровно в том виде, как видишь (в т.ч. приближенную zoom_image), в полном качестве"},
                     "file_path": {"type": "string", "description": "Приложить файл с компьютера: полный путь"}
                 },
                 "required": ["text"]
@@ -457,8 +460,9 @@ TELEGRAM_TOOLS = [
         "function": {
             "name": "sticker",
             "description": (
-                "Стикеры в Telegram. Понравился присланный стикер — сохрани себе (save, sticker_id из пометки, в "
-                "note — когда его уместно слать); потом отправляй свои (send). Список своих — list."
+                "Стикеры в Telegram. Новые присланные стикеры попадают в твою коллекцию сами, с пометкой, что они "
+                "значат; save — переписать пометку своими словами (в note — когда его уместно слать). Отправить — "
+                "send (или короче: <sticker>sticker_id</sticker> прямо в ответе). Вся коллекция — list."
             ),
             "parameters": {
                 "type": "object",
@@ -527,7 +531,8 @@ def save_memory_handler(mm: MemoryManager, path: str, content: str, confidence: 
     Обёртка для вызова mm.save_fact.
     MemoryManager.save_fact уже возвращает строку с результатом (включая конфликты).
     """
-    return mm.save_fact(path, content, confidence=confidence)
+    # Якорь (c=1) — только подтверждение пользователя (verify_fact): свои догадки модель ставила якорем
+    return mm.save_fact(path, content, confidence=min(confidence, MAX_MODEL_CONFIDENCE))
 
 
 def _monitor_arg(kwargs: dict) -> int:
@@ -538,10 +543,16 @@ def _monitor_arg(kwargs: dict) -> int:
         return 0
 
 
-def send_telegram_handler(telegram, text: str, screenshot=None, file_path: str = "") -> str:
+def send_telegram_handler(telegram, text: str, screenshot=None, file_path: str = "", image=False) -> str:
     if telegram is None:
         return "Telegram не подключён."
     text = str(text or "").strip()
+    if image is True or str(image).lower() == "true":
+        jpeg, label = vision.current_view_jpeg()
+        if jpeg is None:
+            return label
+        return (f"Картинка ({label}) отправлена в Telegram." if telegram.send_photo(jpeg, caption=text)
+                else "Не удалось отправить картинку (нет связи?).")
     if screenshot is not None and screenshot != "":
         try:
             monitor = max(0, int(screenshot))
@@ -624,7 +635,8 @@ def build_registry(mm: MemoryManager, telegram=None, verifier=None, current_chat
     }
     if TELEGRAM_ENABLED:
         registry["send_telegram"] = lambda **kwargs: send_telegram_handler(
-            telegram, kwargs.get("text", ""), screenshot=kwargs.get("screenshot"), file_path=kwargs.get("file_path", ""))
+            telegram, kwargs.get("text", ""), screenshot=kwargs.get("screenshot"), file_path=kwargs.get("file_path", ""),
+            image=kwargs.get("image", False))
         # Реакции и стикеры — в чат того, кто сейчас пишет (владелец или гость); вне хода из Telegram — владельцу
         registry["telegram_react"] = lambda **kwargs: (
             telegram.react(kwargs.get("emoji", ""), int(kwargs.get("message_id") or 0) or current_chat()[1],

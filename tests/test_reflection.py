@@ -23,7 +23,7 @@ def test_recent_facts_sorted_by_date_and_skip_reflections(rm, memory_dir, monkey
     monkeypatch.setattr(reflection_mod, "REFLECTION_RECENT_FACTS_WINDOW", 3)
     seed_facts(memory_dir, 6)
     write_facts(memory_dir, "reflections/reflection_notes", ["- [2026-12-31 23:59] Своя заметка"])
-    assert rm._recent_facts() == ["(c=+0.20) Факт номер 3", "(c=+0.20) Факт номер 4", "(c=+0.20) Факт номер 5"]
+    assert rm._recent_facts() == [f"[user/facts] (c=+0.20) Факт номер {i}" for i in (3, 4, 5)]
 
 
 def test_queue_reflection_needs_enough_facts(rm, memory_dir, capsys):

@@ -31,10 +31,14 @@ from scripts.config import (
 # 1280x720 примерно соответствуют ~3000 символам русского текста.
 IMAGE_CHARS_ESTIMATE = 3000
 
-IMAGE_PLACEHOLDER = "[изображение — уже просмотрено, сама картинка удалена из истории]"
+IMAGE_PLACEHOLDER = ("[изображение — уже просмотрено, сама картинка удалена из истории; если выше указан файл — "
+                     "взглянуть снова можно через view_image]")
 
 # Меньше этого (в пикселях оригинала) кроп не делаем — там уже нечего разглядывать.
 MIN_CROP_SIDE = 16
+
+# Приближение, отправляемое в Telegram, увеличивается хотя бы до этой стороны (не больше ZOOM_MAX_UPSCALE раз)
+SEND_MIN_SIDE = 800
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -148,6 +152,20 @@ class VisionState:
                         f"передано в {sent[0]}x{sent[1]}. Дальнейшие координаты zoom_image — "
                         f"относительно ЭТОГО приближения; from_full=true — относительно всего изображения."),
         }
+
+    def current_view_jpeg(self, quality: int = 90) -> Tuple[Optional[bytes], str]:
+        """То, что модель рассматривает сейчас (с учётом zoom), из оригинала в полном разрешении: (JPEG, подпись)."""
+        with self._lock:
+            if self.source is None:
+                return None, "Ошибка: ты сейчас ничего не рассматриваешь — сначала look_at_screen или view_image."
+            crop = self.source.crop(self.view)
+            label = self.label if self.view == (0, 0, *self.source.size) else f"{self.label}, приближение"
+        scale = min(SEND_MIN_SIDE / max(crop.size), ZOOM_MAX_UPSCALE)
+        if scale > 1:  # крошечный кроп в Telegram не разглядеть — увеличиваем, как для модели
+            crop = crop.resize((round(crop.width * scale), round(crop.height * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=quality)
+        return buf.getvalue(), label
 
     def screen_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
         """

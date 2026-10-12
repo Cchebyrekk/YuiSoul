@@ -24,6 +24,7 @@ from scripts.config import (
     REFLECTION_MIN_INTERVAL,
     REFLECTION_MIN_FACTS,
     REFLECTION_RECENT_FACTS_WINDOW,
+    REFLECTION_NOTES_MAX_LINES,
     ENABLE_SLEEP_CONSOLIDATION,
     SLEEP_CONSOLIDATION_EVERY_N_CYCLES,
     SLEEP_CONSOLIDATION_RELATED_FILES,
@@ -32,6 +33,8 @@ from scripts.config import (
     SLEEP_CONSOLIDATION_TEMPERATURE,
 )
 from scripts.memory.manager import MemoryManager
+from scripts.memory.people import people
+from scripts.memory.dreams import MOODS
 from scripts.agent.autonomy import seconds_since_activity
 from scripts.utils.http import SESSION
 
@@ -127,19 +130,26 @@ def apply_sleep_edits(records: list, edits: list) -> tuple:
 
 
 REFLECTION_PROMPT = (
-    "<system_event>Время рефлексии. Вот самые свежие факты из твоей памяти:\n{facts}\n\n"
+    "<system_event>Время рефлексии. Вот самые свежие факты из твоей памяти (в скобках — откуда факт; "
+    "«про …, а не про твоего человека» — это о другом человеке, не приписывай это своему):\n{facts}\n\n"
     "Подумай про себя: какие между ними связи и противоречия, что из этого следует для тебя и для "
     "ваших отношений с пользователем, чего ты не знаешь и что хотела бы уточнить. "
     "Ты сейчас одна: весь твой текст — мысли про себя, пользователь их НЕ слышит. Поэтому думай о нём "
     "в третьем лице и не обращайся к нему в мыслях. Можешь думать в несколько шагов:\n"
     "- стоит что-то проверить или узнать — поищи (search_web, read_webpage) или загляни в память (search_memory);\n"
     "- важные выводы сохрани через save_memory: о себе — в system/yui/yui_character или "
-    "system/yui/yui_preferences, о пользователе — в user/..., общие наблюдения — в reflections/reflection_notes; "
+    "system/yui/yui_preferences, о пользователе — в user/... (только то, что он правда говорил или делал; "
+    "твои догадки о нём — в reflections/reflection_notes), общие наблюдения — в reflections/reflection_notes; "
     "если факт оказался неверным — сохрани исправление с отрицательным confidence;\n"
     "- захочется что-то сказать или спросить у него — только через инструмент speak_aloud.\n"
     "{doubtful}"
     "Когда закончишь — вызови инструмент task_complete (вызови, а не пиши об этом).</system_event>"
 )
+
+# Только что приснившийся сон — в первую рефлексию после него (раньше он был виден лишь фоном в душе, и она о нём
+# не думала)
+DREAM_NOTE = ("- только что тебе приснился сон ({mood}): «{dream}» Проснулась с чувством: {feeling}. Подумай о нём: "
+              "что из твоих дней в нём проступило, что он для тебя значит. Захочешь — расскажешь ему потом.\n")
 
 DOUBTFUL_NOTE = ("- во сне ты засомневалась в этих фактах; если какой-то правда важен — уточни у пользователя "
                  "(verify_fact, по одному, не больше одного за раз):\n{facts}\n")
@@ -170,6 +180,7 @@ class ReflectionManager:
         self.min_interval = min_interval
         self.idle_threshold = idle_threshold
         self._last_cycle = 0.0
+        self._fresh_dream = None  # сон, о котором она ещё не думала, — в ближайшую рефлексию
         self.agent_is_working = agent_is_working
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -218,44 +229,77 @@ class ReflectionManager:
                 continue  # основной цикл сейчас держит LLM — не мешаем
 
             self._last_cycle = time.monotonic()
+            # Сон-консолидация и сновидение — ДО рефлексии: поставленную в очередь рефлексию основной цикл сразу
+            # берёт и помечает Юи занятой, и проверки после неё почти всегда видели «занята» и пропускали
+            # (живой прогон: ни одного сна). Сейчас LLM свободна — проверено выше.
+            # Раз в N циклов — "сонная" консолидация памяти (RAG 2.0, по образцу sleepingConsolidation из kuni):
+            # лёгкая рефлексия-инсайт срабатывает чаще, тяжёлая переработка файлов памяти — реже.
+            self._cycle_count += 1
+            try:
+                self._archive_old_notes()
+            except Exception as e:
+                print(f"[REFLECTION] Архив заметок: {e}")
+            if ENABLE_SLEEP_CONSOLIDATION and self._cycle_count % SLEEP_CONSOLIDATION_EVERY_N_CYCLES == 0:
+                try:
+                    self._run_sleep_consolidation_cycle()
+                except Exception as e:
+                    print(f"[REFLECTION] sleep_consolidation error: {e}")
+            # Сновидение: не чаще раза в сутки, ночью или после долгой тишины (см. memory/dreams.py)
+            if self.dreams is not None and self.dreams.due(datetime.datetime.now(), seconds_since_activity()):
+                try:
+                    self._fresh_dream = self.dreams.weave() or self._fresh_dream
+                except Exception as e:
+                    print(f"[DREAM] Ошибка: {e}")
+            if self.agent_is_working is not None and self.agent_is_working.is_set() or not self.is_due():
+                # Пока снился сон, успела начаться мысль автономии или заговорил пользователь — рефлексия на
+                # следующей проверке, а не через REFLECTION_MIN_INTERVAL (замерено: сон был, рефлексии — нет)
+                self._last_cycle = 0.0
+                continue
             try:
                 self._queue_reflection()
             except Exception as e:
                 print(f"[REFLECTION ERROR] {e}")
 
-            # Раз в N циклов — "сонная" консолидация памяти (RAG 2.0, по
-            # образцу sleepingConsolidation из kuni). Отдельная ветка, чтобы
-            # лёгкая рефлексия-инсайт срабатывала чаще, а тяжёлая
-            # переработка файлов памяти — реже.
-            self._cycle_count += 1
-            sleep_due = ENABLE_SLEEP_CONSOLIDATION and self._cycle_count % SLEEP_CONSOLIDATION_EVERY_N_CYCLES == 0
-            agent_busy_now = self.agent_is_working is not None and self.agent_is_working.is_set()
-            if sleep_due and not agent_busy_now:
-                try:
-                    self._run_sleep_consolidation_cycle()
-                except Exception as e:
-                    print(f"[REFLECTION] sleep_consolidation error: {e}")
-
-            # Сон со сновидением: не чаще раза в сутки, ночью или после долгой тишины (см. memory/dreams.py)
-            agent_busy_now = self.agent_is_working is not None and self.agent_is_working.is_set()
-            dream_due = (self.dreams is not None and not agent_busy_now
-                         and self.dreams.due(datetime.datetime.now(), seconds_since_activity()))
-            if dream_due:
-                try:
-                    self.dreams.weave()
-                except Exception as e:
-                    print(f"[DREAM] Ошибка: {e}")
+    def _archive_old_notes(self):
+        """
+        Заметки рефлексии (reflections/reflection_*.md) только росли: сон их не переписывает, и за три дня
+        набралось 18 тыс. символов. Оставляем последние REFLECTION_NOTES_MAX_LINES, старое — в архив месяца
+        (archive/reflections_ГГГГ-ММ): поиск по памяти его находит, а в «душу» оно больше не идёт.
+        Архив — НЕ в папке reflections/: любой путь в ней псевдоним в manager.py сводит к reflection_notes,
+        и «архив» записывался бы в сам файл заметок и тут же затирался — старые заметки просто пропадали
+        (поймано тестом до запуска на живой памяти).
+        """
+        folder = os.path.join(self.mm.base_dir, "reflections")
+        if not os.path.isdir(folder):
+            return
+        for file in os.listdir(folder):
+            if not (file.startswith("reflection_") and file.endswith(".md")):
+                continue
+            doc = f"reflections/{file[:-3]}"
+            records = self.mm.read_fact_records(doc)
+            if len(records) <= REFLECTION_NOTES_MAX_LINES:
+                continue
+            old, keep = records[:-REFLECTION_NOTES_MAX_LINES], records[-REFLECTION_NOTES_MAX_LINES:]
+            archive = f"archive/reflections_{datetime.date.today():%Y-%m}"
+            self.mm.write_fact_records(archive, self.mm.read_fact_records(archive) + old)
+            self.mm.write_fact_records(doc, keep)
+            print(f"[REFLECTION] Старые заметки ({len(old)}) убраны в архив {archive}.")
 
     def _recent_facts(self) -> list:
-        """Самые свежие факты из памяти (кроме папки reflections), по дате записи."""
+        """
+        Самые свежие факты из памяти (кроме папки reflections), по дате записи — с подписью, откуда факт:
+        без неё факты о гостях из Telegram рефлексия приписывала владельцу (замерено).
+        """
         all_facts = []
         for root, _, files in os.walk(self.mm.base_dir):
-            # Игнорируем папку reflections, чтобы не читать свои же заметки
-            if "reflections" in root.split(os.sep):
+            # Игнорируем папку reflections, чтобы не читать свои же заметки, и их архив
+            if {"reflections", "archive"} & set(root.split(os.sep)):
                 continue
             for file in files:
                 if not file.endswith(".md"):
                     continue
+                doc_id = os.path.relpath(os.path.join(root, file), self.mm.base_dir).replace("\\", "/")[:-3]
+                source = people.fact_prefix(doc_id) or f"[{doc_id}] "
                 try:
                     with open(os.path.join(root, file), "r", encoding="utf-8") as f:
                         content = f.read()
@@ -265,7 +309,7 @@ class ReflectionManager:
                 for line in content.split('\n'):
                     match = re.match(r'^-\s*\[(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})\]\s*(.+)$', line.strip())
                     if match:
-                        all_facts.append((match.group(1), match.group(2).strip()))
+                        all_facts.append((match.group(1), source + match.group(2).strip()))
         all_facts.sort(key=lambda item: item[0])
         return [fact for _, fact in all_facts[-REFLECTION_RECENT_FACTS_WINDOW:]]
 
@@ -278,8 +322,12 @@ class ReflectionManager:
         doubtful = self.doubtful() if self.doubtful is not None else []
         doubtful_note = DOUBTFUL_NOTE.format(facts="\n".join(
             f"  [{d['path']}] {d['text']}" for d in doubtful[-5:])) if doubtful else ""
-        prompt = REFLECTION_PROMPT.format(facts="\n".join(f"- {f}" for f in facts), doubtful=doubtful_note)
+        dream = self._fresh_dream
+        dream_note = DREAM_NOTE.format(mood=MOODS[dream["mood"]][0], dream=dream["dream"],
+                                       feeling=dream.get("feeling") or "—") if dream else ""
+        prompt = REFLECTION_PROMPT.format(facts="\n".join(f"- {f}" for f in facts), doubtful=doubtful_note + dream_note)
         self.input_queue.put(("reflection", prompt, {"timestamp": time.time(), "facts": len(facts)}))
+        self._fresh_dream = None
 
     def force_reflection(self):
         """Поставить рефлексию в очередь прямо сейчас (для ручного вызова)."""
@@ -291,7 +339,7 @@ class ReflectionManager:
         """Список путей (без .md) всех файлов памяти, кроме служебной папки reflections/."""
         paths = []
         for root, _, files in os.walk(self.mm.base_dir):
-            if {"reflections", "diary"} & set(root.split(os.sep)):  # заметки и дневник чувств сон не переписывает
+            if {"reflections", "diary", "images", "archive"} & set(root.split(os.sep)):  # заметки, дневник и описания картинок сон не трогает
                 continue
             for file in files:
                 if not file.endswith(".md"):
